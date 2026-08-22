@@ -484,13 +484,38 @@ ForgeFIRM **never downloads or installs factory firmware.**
 | `/data/etc/gfhome.conf` (seeded from `/etc/gfhome.conf.sample`) | `SERVICE.*` (server/status URLs), `FACTORY_FIRMWARE.CHECK` / `STATUS_FILE`, `FORGECTRL.URL`, `LOGGING.SAVE_PULS` / `SAVE_SENT_IMAGES` (both default off) and `LOGGING.CAPTURE_DIR` (default `/data/forgefirm/captures/<app>`), `MOTION.*`, `THERMAL.*`. |
 | `/data/forgefirm.conf` (managed from the forgectrl UI) | `controller_mode` (`grbl` / `cloud`, read by the forgectrl supervisor, which spawns exactly one controller at boot and on every mode switch; the init scripts defer to it), `homing_mode`, identity overrides `gf_serial` / `gf_password` (a serial override re-derives the hostname), the pause pair `cloud_pause_backtrack_ticks` / `cloud_resume_lead_ticks`, the download guards `pulse_warn_threshold_bytes` / `pulse_reject_threshold_bytes` (bytes of compressed body held in memory, unset = 32 MiB warn and 128 MiB refuse, 0 lifts either), and the log levels `log_gfcloud_disk` / `log_gfcloud_remote` and `log_gfhome_*` (each `off`..`debug`; read at process start, so applied at reboot). |
 
+## The offline service
+
+`gfcloud.py --offline`, or a start while the marker file
+`/run/gfcloud-offline` exists, runs the machine under gfutilities'
+`OfflineService` instead of the web service: no sign-in, no WebSocket,
+no network. A UNIX socket, `/run/gfcloud-offline.sock`, takes the
+service's action messages exactly as the service would send them (one
+JSON object per line: `id`, `action_type`, `status`, `motion_url`,
+`settings`) and hands back every event the machine would have sent the
+service, one per line, to every connected client; each event is also
+logged (`offline event: ...`). The session the machine is given serves
+`file://` URLs, so a `print` whose `motion_url` names a local pulse file
+loads it through the same header check, pulse source and run loop a
+service job takes, and sinks any upload (an image capture completes
+without reaching anywhere). Everything downstream of dispatch is the
+object graph the service drives; the service itself is what is absent.
+
+This is the lever the acceptance tests use to exercise the machine's
+print behavior (the lid and interlock aborts, the button-wait cancel, a
+paused print ended by the lid, a print longer than the ring) without an
+account, a network, or a job designed in the app; the service protocol
+is proven separately, by a real print and by the emulator. The marker
+is under `/run`, so a reboot never comes up offline by accident, and the
+log carries `OFFLINE service` while the client runs this way.
+
 ## Outstanding items
 
 Everything the bench can exercise is exercised: the `cloud.*` acceptance
 tests cover mode switching, service homing, the lid and interlock aborts,
-the button-wait cancel, a hunt with the lid open, pause and resume, the
-paused and running cancel paths, and a print longer than the ring fed from
-the live service. What is left is below.
+the button-wait cancel, a hunt with the lid open, pause and resume, a
+paused print cancelled by the lid, and a print longer than the ring with
+the cancel from the app. What is left is below.
 
 - **8 MP ("HD") machines:** an OV8856 machine captures 3264x2448, not the
   2592x1944 a 5 MP machine sends. Whether the service accepts a larger image

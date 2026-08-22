@@ -12,6 +12,14 @@ Reconnects (fresh single-use ws_token) and 401 re-auth are handled in
 gfutilities. On SIGTERM the service loop stops and the machine is shut
 down safe (laser latched, steppers disabled, deadman released).
 
+Offline: with --offline, or while the marker file OFFLINE_MARKER exists
+at start, the machine runs under gfutilities' OfflineService instead: no
+account, no network, a local socket (OFFLINE_SOCKET) that takes the
+service's action messages and hands back the machine's events. The
+acceptance tests use it to run the machine's print behavior without a
+job from the app. The marker lives under /run, so a reboot never comes
+up offline by accident.
+
 (C) Copyright 2026
 Scott Wiederhold, s.e.wiederhold@gmail.com
 SPDX-License-Identifier: MIT
@@ -32,6 +40,8 @@ import ffmachine
 
 CONF = '/data/etc/gfhome.conf'
 CONF_SAMPLE = '/etc/gfhome.conf.sample'
+OFFLINE_MARKER = '/run/gfcloud-offline'
+OFFLINE_SOCKET = '/run/gfcloud-offline.sock'
 
 logger = logging.getLogger('openglow')
 
@@ -57,7 +67,11 @@ def load_config(path: str) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description='ForgeFIRM full Glowforge cloud controller')
     ap.add_argument('-c', '--config', default=CONF, help='config file (default %s)' % CONF)
+    ap.add_argument('--offline', action='store_true',
+                    help='no web service: take actions on %s (also when %s exists)'
+                         % (OFFLINE_SOCKET, OFFLINE_MARKER))
     args = ap.parse_args()
+    offline = args.offline or Path(OFFLINE_MARKER).exists()
 
     # Logging first: syslog under the gfcloud program name, level from
     # /data/forgefirm.conf (log_gfcloud_disk / _remote).
@@ -76,7 +90,12 @@ def main() -> int:
                          'controller_mode must be cloud)')
         return 1
 
-    service = GFUIService(machine)
+    if offline:
+        from gfutilities.service.offline import OfflineService
+        logger.info('offline: actions from %s, no web service', OFFLINE_SOCKET)
+        service = OfflineService(machine, path=OFFLINE_SOCKET)
+    else:
+        service = GFUIService(machine)
 
     def _shutdown(*_):
         logger.info('shutdown requested')
