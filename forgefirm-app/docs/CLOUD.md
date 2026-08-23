@@ -509,6 +509,33 @@ is proven separately, by a real print and by the emulator. The marker
 is under `/run`, so a reboot never comes up offline by accident, and the
 log carries `OFFLINE service` while the client runs this way.
 
+## The emulator in this machine's identity
+
+`gfcloud.py --emulate`, or a start while the marker file
+`/run/gfcloud-emulate` exists, runs the real service session with
+gfutilities' `Emulator` in place of the hardware machine: the serial,
+hostname and password come from the fuses (or the shared config's
+overrides) exactly as for the real client, the session signs in and
+opens the WebSocket exactly as the real client does, and every action
+the service sends is answered the way the emulator answers it: canned
+frames for the captures (the dev image's gfutilities fixtures under
+`/usr/share/gfutilities/emulator/`, captured on a machine of this type
+with the head at its calibrated home), the pulse file downloaded and
+parsed through the same path a job takes, and a print reported running
+and complete without a button wait and without moving anything. Nothing
+is armed and nothing moves; the pulse device is never opened.
+
+This is the lever the acceptance tests use to prove the service protocol
+(sign-in, the firmware check, the WebSocket, the hunt, the image uploads,
+a print's download and lifecycle as the app sees them) with nobody at
+the machine: only the app has to be driven. What it cannot prove is the
+machine's side of a print (progress, the button wait, the pause, the
+aborts); those are the real print and the offline tests. The real client
+must be down before the emulator signs in (the service holds one session
+per machine), so the tests stop the controller, set the marker, start it,
+and restart it without the marker when done. Same marker rule as the
+offline service: under `/run`, one start, never a persisted setting.
+
 ## Outstanding items
 
 Everything the bench can exercise is exercised: the `cloud.*` acceptance

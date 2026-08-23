@@ -20,6 +20,13 @@ acceptance tests use it to run the machine's print behavior without a
 job from the app. The marker lives under /run, so a reboot never comes
 up offline by accident.
 
+Emulate: with --emulate, or while EMULATE_MARKER exists at start, the
+real service is driven by gfutilities' Emulator in this machine's
+identity instead of the hardware: it answers the service with canned
+frames (EMULATOR_DIR, the dev image's gfutilities fixtures) and completes
+prints without moving anything, which proves the service protocol with
+nobody at the machine. Same marker rule.
+
 (C) Copyright 2026
 Scott Wiederhold, s.e.wiederhold@gmail.com
 SPDX-License-Identifier: MIT
@@ -42,6 +49,9 @@ CONF = '/data/etc/gfhome.conf'
 CONF_SAMPLE = '/etc/gfhome.conf.sample'
 OFFLINE_MARKER = '/run/gfcloud-offline'
 OFFLINE_SOCKET = '/run/gfcloud-offline.sock'
+EMULATE_MARKER = '/run/gfcloud-emulate'
+EMULATOR_DIR = '/usr/share/gfutilities/emulator'
+EMULATOR_WORK = '/tmp/gfcloud-emulate'
 
 logger = logging.getLogger('openglow')
 
@@ -70,8 +80,12 @@ def main() -> int:
     ap.add_argument('--offline', action='store_true',
                     help='no web service: take actions on %s (also when %s exists)'
                          % (OFFLINE_SOCKET, OFFLINE_MARKER))
+    ap.add_argument('--emulate', action='store_true',
+                    help="the real service driven by the emulator in this machine's identity, "
+                         'no hardware (also when %s exists)' % EMULATE_MARKER)
     args = ap.parse_args()
     offline = args.offline or Path(OFFLINE_MARKER).exists()
+    emulate = args.emulate or Path(EMULATE_MARKER).exists()
 
     # Logging first: syslog under the gfcloud program name, level from
     # /data/forgefirm.conf (log_gfcloud_disk / _remote).
@@ -84,7 +98,7 @@ def main() -> int:
     # Machine() reads the OCOTP identity and head info; it fails cleanly if
     # grblHAL still holds /dev/glowforge (controller_mode must be cloud).
     try:
-        machine = ffmachine.build_machine()
+        machine = ffmachine.build_emulator(EMULATOR_DIR, EMULATOR_WORK) if emulate             else ffmachine.build_machine()
     except Exception:
         logger.exception('machine init failed (is grblHAL still running? '
                          'controller_mode must be cloud)')

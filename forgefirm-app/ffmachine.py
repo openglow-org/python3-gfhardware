@@ -150,6 +150,32 @@ def apply_identity_overrides(machine_conf: str = MACHINE_CONF) -> None:
                            'the fuse derivation')
 
 
+def build_emulator(image_dir: str, work_dir: str):
+    """The gfutilities Emulator in this machine's identity: the serial,
+    hostname and password from the OCOTP fuses (an override from the
+    shared config, applied before this, wins the way it does for the
+    hardware machine), the canned frames from image_dir, the downloads
+    under work_dir. It touches no hardware: the service sees a machine
+    that homes, images and prints at once, and the protocol is what gets
+    exercised."""
+    import os
+    from gfhardware import id as machine_id
+    from gfutilities import Emulator
+    for key, value in (('MACHINE.SERIAL', machine_id.serial()),
+                       ('MACHINE.HOSTNAME', machine_id.hostname()),
+                       ('MACHINE.PASSWORD', machine_id.password())):
+        set_cfg(key, value, True)
+    os.makedirs(work_dir, exist_ok=True)
+    set_cfg('EMULATOR.IMAGE_SRC_DIR', image_dir)
+    set_cfg('EMULATOR.MOTION_DL_DIR', work_dir)
+    set_cfg('EMULATOR.FIRMWARE_DL_DIR', work_dir)
+    set_cfg('EMULATOR.BYPASS_HOMING', True)
+    set_cfg('EMULATOR.MATERIAL_THICKNESS', '.230')
+    logger.info("EMULATE: the emulator in this machine's identity, frames from %s, no hardware",
+                image_dir)
+    return Emulator()
+
+
 def build_machine():
     """Build the hardware Machine with captures routed through forgectrl.
 
