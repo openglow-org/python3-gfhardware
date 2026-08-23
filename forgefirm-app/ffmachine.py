@@ -179,6 +179,18 @@ def build_emulator(image_dir: str, work_dir: str):
     return Emulator()
 
 
+def inhibit_connect_hunt() -> None:
+    """No connect-time hunt: the first settings report goes out in the
+    reconnect form (no values), which the service answers by keeping the
+    head position it already has instead of homing. Only for a start
+    where the service already knows where the head is; a print placed on
+    a stale position can run the gantry into a rail, so the acceptance
+    tests hunt before the one real print regardless."""
+    set_cfg('SETTINGS.SET', True)
+    logger.info('NO-HUNT: the first settings report in the reconnect form; the service keeps '
+                'its head position, no connect-time hunt')
+
+
 def build_machine():
     """Build the hardware Machine with captures routed through forgectrl.
 

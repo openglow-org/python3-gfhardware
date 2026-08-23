@@ -536,6 +536,26 @@ per machine), so the tests stop the controller, set the marker, start it,
 and restart it without the marker when done. Same marker rule as the
 offline service: under `/run`, one start, never a persisted setting.
 
+## Starting without the connect-time hunt
+
+`gfcloud.py --no-hunt`, or a start while the marker file
+`/run/gfcloud-nohunt` exists, sends the first settings report in the
+reconnect form (no values). The service answers that form by keeping the
+head position it already has instead of sending its connect-time hunt,
+which is what the factory client does on every reconnect within a
+session (gfutilities does the same: only a process's first report
+carries the values). The log carries `NO-HUNT:` at the start. It is for
+a restart where the service already knows where the head is, which is
+what the acceptance tests do between tests that do not home; a fresh
+boot, the homing tests, and the one real print report the values and
+get the hunt, because a print placed on a stale head position can run
+the gantry into a rail. The offline service has no hunt to skip and the
+emulator keeps its hunt, so the marker is ignored under either.
+
+The three markers share one rule: under `/run`, so a reboot never comes
+up with one; read by the client that starts, and taken down by it, so a
+marker applies to that one start and never to a respawn after it.
+
 ## Outstanding items
 
 Everything the bench can exercise is exercised: the `cloud.*` acceptance

@@ -2,7 +2,9 @@
 The emulator built for the board: gfutilities' Emulator in this machine's
 identity, answering the service with a full settings report so the
 connect-time hunt is sent (an empty report asks the service to skip
-homing, which the protocol test must not do).
+homing, which the protocol test must not do). And the opposite lever for
+the hardware machine: inhibit_connect_hunt makes the first report the
+reconnect form, so the service keeps its head position.
 
 Host-side: the fuse identity is stubbed, gfutilities comes from the
 sibling checkout, nothing touches hardware.
@@ -77,6 +79,42 @@ class EmulatorBuild(unittest.TestCase):
                         % frame['settings'])
         self.assertEqual(values['SAid'], 77)
         self.assertIn('MCsn', values)
+
+
+class NoHunt(unittest.TestCase):
+    def setUp(self):
+        for key in ('SETTINGS.SET', 'EMULATOR.ACTIVE', 'EMULATOR.BYPASS_HOMING'):
+            set_cfg(key, None)
+
+    def _report(self):
+        q = Queue()
+        settings_mod.send_report(q, {'id': 5})
+        return json.loads(q.get_nowait())['settings']
+
+    def test_the_first_report_carries_the_values_by_default(self):
+        self.assertTrue(self._report().get('values'))
+
+    def test_inhibit_connect_hunt_makes_the_first_report_the_reconnect_form(self):
+        ffmachine.inhibit_connect_hunt()
+        self.assertEqual(self._report(), {})
+        # and every report after it, as on a reconnect
+        self.assertEqual(self._report(), {})
+
+
+class OneStartMarkers(unittest.TestCase):
+    def test_a_marker_is_read_and_taken_down_by_the_start_that_found_it(self):
+        import gfcloud
+        d = tempfile.mkdtemp()
+        present, absent = os.path.join(d, 'nohunt'), os.path.join(d, 'offline')
+        open(present, 'w').close()
+        found = gfcloud.take_markers((present, absent))
+        self.assertEqual(found, {present: True, absent: False})
+        self.assertFalse(os.path.exists(present))          # this start only
+        self.assertEqual(gfcloud.take_markers((present, absent)), {present: False, absent: False})
+
+    def test_the_markers_are_read_before_the_slow_imports(self):
+        src = open(os.path.join(ROOT, 'forgefirm-app', 'gfcloud.py')).read()
+        self.assertLess(src.index('MARKERS = take_markers()'), src.index('from gfutilities'))
 
 
 if __name__ == '__main__':
