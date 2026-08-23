@@ -157,7 +157,10 @@ def build_emulator(image_dir: str, work_dir: str):
     hardware machine), the canned frames from image_dir, the downloads
     under work_dir. It touches no hardware: the service sees a machine
     that homes, images and prints at once, and the protocol is what gets
-    exercised."""
+    exercised. The connect-time hunt is kept: the settings report carries
+    the machine values (an empty report is the emulator's way of asking
+    the service to skip homing), so the service sends its hunt and the
+    emulator walks it from the canned home frames."""
     import os
     from gfhardware import id as machine_id
     from gfutilities import Emulator
@@ -169,7 +172,7 @@ def build_emulator(image_dir: str, work_dir: str):
     set_cfg('EMULATOR.IMAGE_SRC_DIR', image_dir)
     set_cfg('EMULATOR.MOTION_DL_DIR', work_dir)
     set_cfg('EMULATOR.FIRMWARE_DL_DIR', work_dir)
-    set_cfg('EMULATOR.BYPASS_HOMING', True)
+    set_cfg('EMULATOR.BYPASS_HOMING', False)
     set_cfg('EMULATOR.MATERIAL_THICKNESS', '.230')
     logger.info("EMULATE: the emulator in this machine's identity, frames from %s, no hardware",
                 image_dir)
