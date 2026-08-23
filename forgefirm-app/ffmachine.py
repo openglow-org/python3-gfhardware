@@ -174,8 +174,17 @@ def build_emulator(image_dir: str, work_dir: str):
     set_cfg('EMULATOR.FIRMWARE_DL_DIR', work_dir)
     set_cfg('EMULATOR.BYPASS_HOMING', False)
     set_cfg('EMULATOR.MATERIAL_THICKNESS', '.230')
-    logger.info("EMULATE: the emulator in this machine's identity, frames from %s, no hardware",
-                image_dir)
+    # A controller under forgectrl reports its job state to the cooling
+    # engine (~1 Hz; the supervisor waits for the first report before it
+    # calls a mode switch complete). The emulator never arms or runs, so
+    # it reports idle and unarmed for as long as it lives.
+    from gfhardware.coolsvc import cooling_svc
+    cooling_svc.set_mode('idle')
+    cooling_svc.set_armed(False)
+    if not cooling_svc.is_alive():
+        cooling_svc.start()
+    logger.info("EMULATE: the emulator in this machine's identity, frames from %s, no hardware; "
+                "reporting idle to the cooling engine", image_dir)
     return Emulator()
 
 

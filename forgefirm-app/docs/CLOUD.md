@@ -523,7 +523,10 @@ frames for the captures (the dev image's gfutilities fixtures under
 with the head at its calibrated home), the pulse file downloaded and
 parsed through the same path a job takes, and a print reported running
 and complete without a button wait and without moving anything. Nothing
-is armed and nothing moves; the pulse device is never opened.
+is armed and nothing moves; the pulse device is never opened. Like any
+controller under forgectrl it reports its job state to the cooling
+engine, idle and unarmed for as long as it lives, so the supervisor's
+mode switch completes on the report the way it does for the real client.
 
 This is the lever the acceptance tests use to prove the service protocol
 (sign-in, the firmware check, the WebSocket, the hunt, the image uploads,

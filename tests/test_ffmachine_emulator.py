@@ -43,16 +43,39 @@ from gfutilities.configuration import get_cfg, set_cfg            # noqa: E402
 from gfutilities.device import settings as settings_mod           # noqa: E402
 
 
+def real_coolsvc():
+    """The real cooling client as a fresh module instance: other suites
+    install a fake under the same name, and the emulator's reporter must
+    never touch that one."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'gfhardware.coolsvc', os.path.join(ROOT, 'gfhardware', 'coolsvc.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 class EmulatorBuild(unittest.TestCase):
     def setUp(self):
         self.work = tempfile.mkdtemp()
-        # build_emulator imports the identity at call time: other suites
-        # install their own stub, so pin this one per test.
+        # build_emulator imports the identity and the cooling client at
+        # call time: other suites install their own stubs, so pin these
+        # per test.
         sys.modules['gfhardware.id'] = _id
         sys.modules['gfhardware'].id = _id
+        self.coolsvc = real_coolsvc()
+        self.saved_coolsvc = sys.modules.get('gfhardware.coolsvc')
+        sys.modules['gfhardware.coolsvc'] = self.coolsvc
         for key in ('MACHINE.SERIAL', 'MACHINE.HOSTNAME', 'MACHINE.PASSWORD',
                     'SETTINGS.SET', 'EMULATOR.ACTIVE', 'EMULATOR.BYPASS_HOMING'):
             set_cfg(key, None)
+
+    def tearDown(self):
+        self.coolsvc.cooling_svc.stop = True
+        if self.saved_coolsvc is not None:
+            sys.modules['gfhardware.coolsvc'] = self.saved_coolsvc
+        else:
+            sys.modules.pop('gfhardware.coolsvc', None)
 
     def test_identity_is_the_machines(self):
         ffmachine.build_emulator(self.work, self.work)
@@ -61,6 +84,14 @@ class EmulatorBuild(unittest.TestCase):
         self.assertEqual(get_cfg('MACHINE.PASSWORD'), 'f' * 64)
         self.assertTrue(get_cfg('EMULATOR.ACTIVE'))
         self.assertEqual(get_cfg('EMULATOR.IMAGE_SRC_DIR'), self.work)
+
+    def test_the_emulator_reports_idle_to_the_cooling_engine(self):
+        svc = self.coolsvc.cooling_svc
+        ffmachine.build_emulator(self.work, self.work)
+        self.assertTrue(svc.is_alive())                          # the 1 Hz reporter is up
+        self.assertEqual(svc._mode, 'idle')
+        self.assertFalse(svc.armed)
+        ffmachine.build_emulator(self.work, self.work)           # a second build does not restart it
 
     def test_a_config_override_wins_over_the_fuses(self):
         set_cfg('MACHINE.SERIAL', 999)
