@@ -406,7 +406,7 @@ The undecided count is the one that should be zero.
 | `PTmn`, `PTmx` | **Declared ignored**: the supply temperature window. The service sends the whole ADC range (a window that cannot trip) and the factory binds the pair to nothing; the supply's raw reading is watched per job by the engine instead. |
 | `BT??`, `HT??`, `LT??`, `IT??`, `FT??` | **Declared ignored**: the board, head, lid, interconnect and fused temperature ceilings, sent in a unit that is not millidegrees and not established. The chassis (board) sensor is watched per job; the other four locations have no sensor on this platform. |
 | `CTrn`, `CTrx` | **Declared ignored**: the coolant window in raw counts, older files only; `CMrn`/`CMrx` carry the same window. |
-| `HA??` | **Declared ignored**: the head accelerometer thresholds (unit and filter unknown). The accelerometer is the motion-liveness probe here; a bench-measured crash detector is its own BRINGUP item. |
+| `HA??` | **Declared ignored**: the head accelerometer thresholds. They are LIS2HH12 interrupt-generator register values, and forgectrl's crash watch runs the same mechanism on its own local knobs (the header defaults are the seeded values), so the per-job copies add nothing. |
 | `IR??` | **Declared ignored**: the lid IR flame thresholds. The lid IR channels read the lid lamp, so these absolute numbers are the prior for the lamp-aware fire watch (BRINGUP "Fire watch"), not a gate. |
 | `HIix`, `HIrx` | **Declared ignored**: the HV current caps. The sampled `LASER_ON` witness covers the idle case, and HV current is ranged in every job's log line. |
 | `TRuc` | **Declared ignored**: thermal report upload conditions, a knob for the factory's telemetry, which is out of scope. |
