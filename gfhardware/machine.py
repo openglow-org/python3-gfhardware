@@ -270,7 +270,8 @@ class _JobProgress:
         # The frame doubles as the periodic settings report. Of the fifteen
         # tags the factory carries there, these are the four that describe
         # the job rather than the machine's sensors, plus the action they
-        # belong to; the sensor readings stay excluded (CLOUD.md, "Scope").
+        # belong to; the sensor readings stay excluded (cloud mode, "Scope":
+        # https://docs.forgefirm.org/technical/forgefirm/cloud-mode/).
         # CCbp is the raw byte position, which is why it can sit past the
         # clamped bar rather than with it.
         send_wss_progress(self._q_tx, self._action_id, self._label, current,
@@ -1178,7 +1179,7 @@ class Machine(BaseMachine):
                 self._run_wake.set()
         elif event.code == InputSwitch.SW_INTERLOCK:
             # Active = the remote-interlock loop OPENED. Not reported to
-            # the service (see docs/CLOUD.md); gates the job like the lid.
+            # the service (cloud mode, docs.forgefirm.org); gates the job like the lid.
             if event.val:
                 logger.info('interlock loop opened')
                 self._enclosure_edge = True

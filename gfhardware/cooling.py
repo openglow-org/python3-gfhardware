@@ -127,8 +127,8 @@ class _TempSensor(object):
     def calc_coolant(in_value: int) -> float:
         # Factory beta-equation conversion: 10k B3380 NTC in a 10k divider
         # behind a 1.3x gain stage, 10-bit ADC. Authoritative statement with
-        # derivation and reference points: kernel-module-glowforge UAPI.md
-        # (coolant section); shared contract: forgectrl docs/SERVICES.md.
+        # derivation and reference points:
+        # https://docs.forgefirm.org/technical/machine/sensors/
         adc_f = 1024 * 1.3
         if in_value <= 0 or in_value >= adc_f:
             return -273.15      # open / shorted sensor
@@ -138,7 +138,7 @@ class _TempSensor(object):
 
     @staticmethod
     def calc_power(in_value: int) -> float:
-        # Best-guess linear fit, unverified (kernel-module-glowforge UAPI.md)
+        # Best-guess linear fit, unverified (documented on the sensors page)
         return (in_value * 0.08715) - 21
 
 

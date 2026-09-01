@@ -60,7 +60,8 @@ class InputDevice(object):
 
         No EVIOCGRAB: other services (forgectrl's status endpoint) read this
         device concurrently, and exclusivity of button *meaning* comes from
-        controller-mode selection (see forgectrl docs/SERVICES.md).
+        controller-mode selection (see the forgectrl contract,
+        https://docs.forgefirm.org/technical/forgefirm/forgectrl/).
         """
         while True:
             r, w, x = select.select([self.fd], [], [], .1)

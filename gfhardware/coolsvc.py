@@ -28,7 +28,8 @@ REPORT_TIMEOUT_S = 0.25
 # engine: the pulse-header tags that bound a gate the engine has or is
 # getting, and the /cool/state parameter each becomes. The engine treats
 # each as a limit that can only tighten its own configured one; a looser
-# value is logged and ignored there (contract: forgectrl docs/SERVICES.md).
+# value is logged and ignored there (contract:
+# https://docs.forgefirm.org/technical/forgefirm/cooling-engine/).
 #
 # Temperatures arrive in millidegrees. The tach windows are maximum
 # periods in the kernel's own units (the factory compares them against
@@ -78,8 +79,8 @@ def limits_from_header(header: dict) -> dict:
 
 
 class CoolingService(Thread):
-    """Client of the forgectrl cooling engine (contract: forgectrl
-    docs/SERVICES.md).
+    """Client of the forgectrl cooling engine (contract:
+    https://docs.forgefirm.org/technical/forgefirm/cooling-engine/).
 
     The engine owns the thermal hardware - fan/pump/TEC/heater profiles,
     coolant flow verification, over-temp policy - for every controller
