@@ -8,7 +8,7 @@ setup(
     description='Glowforge Hardware Support',
     author='Scott Wiederhold',
     author_email='s.e.wiederhold@gmail.com',
-    url='https://github.com/ScottW514/python3-gfhardware',
+    url='https://github.com/openglow-org/python3-gfhardware',
     version='0.1.0',
     license='MIT AND LGPL-2.1-or-later',
     long_description=open('README.md').read(),
