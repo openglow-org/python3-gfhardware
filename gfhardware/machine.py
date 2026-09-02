@@ -412,7 +412,7 @@ class Machine(BaseMachine):
             elif not v.get('hold', True) and v.get('fire_ok'):
                 break
             elif self._running_action_cancelled:
-                abort = 'cancelled'
+                abort = 'canceled'
             else:
                 abort = self._enclosure_open(self._sw_thread.all_switches())
                 if abort is None and monotonic() > deadline:
@@ -1104,7 +1104,7 @@ class Machine(BaseMachine):
                 # A live-fed ring went dry mid-run. The stop was instant, so
                 # steps were skipped at speed: the position is not to be
                 # trusted, and the job did not finish. Acknowledge it (which
-                # returns the device to idle) and report the job cancelled.
+                # returns the device to idle) and report the job canceled.
                 logger.error('pulse buffer ran dry mid-run after %s bytes; '
                              'position is no longer trusted',
                              cnc.position.bytes.processed)
@@ -1121,7 +1121,7 @@ class Machine(BaseMachine):
                 enclosure = 'lid opened'    # an edge the level read already missed
             self._enclosure_edge = False
             # A locally-aborted run must not report ':completed' to the
-            # service: marking the action cancelled routes the finish
+            # service: marking the action canceled routes the finish
             # through the ':cancelled' event.
             if (not park and self._feeder is not None
                     and self._feeder.error is not None):
@@ -1130,7 +1130,7 @@ class Machine(BaseMachine):
                 self._running_action_cancelled = True
                 aborted = True
             elif self._running_action_cancelled and not park:
-                logger.warning('action cancelled mid-run; stopping motion')
+                logger.warning('action canceled mid-run; stopping motion')
                 aborted = True
             elif enclosure is not None and lid_gated and not park:
                 logger.warning('%s mid-run; stopping motion', enclosure)
