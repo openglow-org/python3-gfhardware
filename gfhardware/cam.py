@@ -120,7 +120,7 @@ def _ctrls_ov5648(subdev, exposure, gain):
 def _ctrls_ov8856(subdev, exposure, gain):
     """OV8856 manual controls. The driver exposes a different set: exposure
     counts whole lines (it shifts into the 1/16-line register itself) and is
-    capped by the frame length -- 2482 lines in the 3264x2448 mode -- analogue
+    capped by the frame length -- 2482 lines in the 3264x2448 mode; analog
     gain is 128 = 1x, and there are no auto-exposure, auto-gain or white-balance
     controls to switch off, so the sensor comes up manual and its white balance
     stays uncorrected."""
@@ -280,7 +280,7 @@ def capture(cam_sel: int = GFCAM_LID, exposure: int = None, gain: int = None,
                     value cannot integrate within the frame and returns a blank
                     frame.
     gain         -- sensor gain in that sensor's units (OV5648: 16 = 1x, max
-                    1023; OV8856 analogue gain: 128 = 1x, max 2047); None uses
+                    1023; OV8856 analog gain: 128 = 1x, max 2047); None uses
                     the camera's default.
     illumination -- scene-lighting LED brightness during the grab (lid_led for
                     the lid camera, head white_led for the head)

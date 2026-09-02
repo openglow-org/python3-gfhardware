@@ -42,6 +42,12 @@ logger = logging.getLogger(LOGGER_NAME)
 # the per-job open/flock/close below keeps the original semantics.
 _pulse_stream = None
 
+# The free counter is two SDMA channel-0 transactions per read, on the
+# engine that clocks the steps: the watchdog asks at most this often.
+ROOM_POLL_S = 5.0
+_room_at = 0.0
+_room_last = False
+
 
 def _ring_has_room() -> bool:
     """Whether the ring could take another chunk right now.
@@ -49,12 +55,25 @@ def _ring_has_room() -> bool:
     What tells a stalled feed apart from a full ring: a feeder with nothing
     to do because the window is full is healthy, and the same feeder with
     room in front of it and no progress behind it is not. Fails closed, so
-    an unreadable ring never trips the watchdog.
+    an unreadable ring never trips the watchdog. The answer is cached for
+    ROOM_POLL_S so a quiet feed does not turn into continuous polling.
     """
+    global _room_at, _room_last
+    now = monotonic()
+    if now - _room_at < ROOM_POLL_S:
+        return _room_last
+    _room_at = now
     try:
-        return cnc.free > FEED_CHUNK
+        _room_last = cnc.free > FEED_CHUNK
     except (OSError, ValueError):
-        return False
+        _room_last = False
+    return _room_last
+
+
+def _ring_room_reset() -> None:
+    """Forget the cached answer: every job asks afresh."""
+    global _room_at
+    _room_at = 0.0
 
 
 def _inherited_pulse_dev():
@@ -92,8 +111,7 @@ FEED_STALL_S = 30.0        # no progress, with room to write, is a stalled feed
 FEED_RECOVER_S = 60.0      # how long a held job waits for the feed to move
 FEED_MAX_HOLDS = 3         # a feed that keeps stalling is sawing the material
 
-# A print's warm-up and its rest, in seconds. The factory does both and this
-# machine did neither: measured on this board's own factory slot, a print
+# A print's warm-up and its rest, in seconds. The factory does both: a print
 # holds 3.05 s between configuring the run and starting it, and rests about
 # 10.35 s after its park before it goes idle. That is equipment protection,
 # not ceremony - the warm-up is what gets air and coolant moving before the
@@ -337,9 +355,10 @@ class Machine(BaseMachine):
         self._button_edges: int = 0
         self._enclosure_edge: bool = False
 
-        set_cfg('MACHINE.HEAD_FIRMWARE', self.head_info().version, True)
-        set_cfg('MACHINE.HEAD_ID', self.head_info().hardware_id, True)
-        set_cfg('MACHINE.HEAD_SERIAL', self.head_info().hardware_id, True)
+        head = self.head_info()
+        set_cfg('MACHINE.HEAD_FIRMWARE', head.version, True)
+        set_cfg('MACHINE.HEAD_ID', head.hardware_id, True)
+        set_cfg('MACHINE.HEAD_SERIAL', head.serial, True)
 
         set_cfg('MACHINE.SERIAL', id.serial(), True)
         set_cfg('MACHINE.HOSTNAME', id.hostname(), True)
@@ -434,15 +453,28 @@ class Machine(BaseMachine):
         set_button_color(ButtonColor.WHITE)
         logger.info('waiting for button')
         abort = None
+        # The press is delivered as an edge by the switch thread; the level
+        # read here is the backstop should that thread be gone. A level
+        # counts only after the button has been seen released during the
+        # wait, so a button held (or stuck) before the wait never arms.
+        seen_released = False
         while True:
-            reason = self._enclosure_open(self._sw_thread.all_switches())
+            switches = self._sw_thread.all_switches()
+            reason = self._enclosure_open(switches)
             if self._running_action_cancelled:
-                abort = 'cancelled'
+                abort = 'canceled'
                 break
             if reason is not None:
                 abort = reason
                 break
             if self._button_pressed:
+                break
+            level = switches.get(InputSwitch.SW_BUTTON)
+            if level is False:
+                seen_released = True
+            elif level and seen_released:
+                logger.warning('button press seen as a level, not an edge '
+                               '(is the switch thread alive?)')
                 break
             if monotonic() > deadline:
                 abort = 'timed out'
@@ -586,6 +618,7 @@ class Machine(BaseMachine):
 
     def _motion(self, msg: dict, lid_gated: bool = True) -> None:
         logger.info('start motion')
+        self._motion_stats = {}
         if not self._safe_to_move(lid_gated):
             # Refused before anything moved. The service dead-reckons from
             # the events it gets back, so a job that never ran must end
@@ -645,7 +678,7 @@ class Machine(BaseMachine):
             # or unusable header, or more body than this machine will hold;
             # the reason is logged where it was found): cancel cleanly
             # instead of subscripting False.
-            logger.error('motion file rejected; cancelling the action')
+            logger.error('motion file rejected; canceling the action')
             self._running_action_cancelled = True
             return
         self._motion_stats = stats
@@ -968,7 +1001,7 @@ class Machine(BaseMachine):
         try:
             cnc.resume(lead)
         except OSError as e:
-            logger.error('resume refused (%s); cancelling', e)
+            logger.error('resume refused (%s); canceling', e)
             return False
         return True
 
@@ -991,7 +1024,7 @@ class Machine(BaseMachine):
         (stopped before the program's end), False if it ran to completion.
 
         Reactions during the run - the factory's, both modes alike:
-          - lid or interlock loop opens: controlled stop, job cancelled
+          - lid or interlock loop opens: controlled stop, job canceled
             (a print then parks; the park itself ignores the lid);
           - service cancel: the same stop;
           - cooling verdict pulled: latch relocked, the same stop;
@@ -1006,7 +1039,7 @@ class Machine(BaseMachine):
             job from where it stands.
           - a live feed that stops making progress while the ring has
             room for it: the same stop and retrace, held until the feed
-            moves again, and cancelled rather than left standing if it
+            moves again, and canceled rather than left standing if it
             does not. A dry ring is an underrun and a scrapped job; this
             is the same job with a hidden seam.
         The switch thread wakes this loop on every edge, so a reaction
@@ -1017,6 +1050,7 @@ class Machine(BaseMachine):
         service: once as it starts, at every pause, resume and hold, once
         more when it ends, and on its own interval in between.
         """
+        _ring_room_reset()
         logger.info('starting run')
         logger.info('current state: %s' % cnc.state)
         set_button_color(ButtonColor.WHITE)
@@ -1147,7 +1181,7 @@ class Machine(BaseMachine):
                     continue
                 if monotonic() > hold_deadline:
                     logger.error('held on the cooling verdict for %.0f s (%s); '
-                                 'cancelling the job', hold_max_s,
+                                 'canceling the job', hold_max_s,
                                  v.get('verdict') if v else 'no verdict')
                     self._running_action_cancelled = True
                     aborted = True
@@ -1214,7 +1248,7 @@ class Machine(BaseMachine):
                         continue
                     if now > feed_deadline:
                         logger.error('the pulse feed did not move in %.0f s of '
-                                     'waiting; cancelling the job', FEED_RECOVER_S)
+                                     'waiting; canceling the job', FEED_RECOVER_S)
                         self._running_action_cancelled = True
                         aborted = True
                         break
@@ -1225,7 +1259,7 @@ class Machine(BaseMachine):
                                  'before the ring runs dry', now - feed_at, feed_mark)
                     if feed_holds > FEED_MAX_HOLDS:
                         logger.error('the feed has stalled %d times this job; '
-                                     'cancelling rather than cutting it in pieces',
+                                     'canceling rather than cutting it in pieces',
                                      feed_holds)
                         self._running_action_cancelled = True
                         aborted = True
@@ -1350,7 +1384,11 @@ class Machine(BaseMachine):
             logger.info('machine is not idle, state: %s' % cnc.state.value)
             return False
         temp = temp_sensor.water_2.C
-        if temp > int(get_cfg('THERMAL.MAX_START_TEMP')):
+        # A backstop behind the cooling engine's own start gate (the
+        # verdict is checked again before arming); a config without the
+        # key leaves the gate to the engine.
+        limit = get_cfg('THERMAL.MAX_START_TEMP')
+        if limit is not None and temp > float(limit):
             logger.info('machine temp is too high, temp: %s' % temp)
             return False
         if temp <= -100:

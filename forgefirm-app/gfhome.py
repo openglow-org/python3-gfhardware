@@ -205,7 +205,7 @@ def home(machine, args) -> int:
                 logger.info('%s completed', in_flight)
                 done.add(in_flight)
                 if in_flight == 'motion':
-                    st = getattr(machine, '_motion_stats', {}).get('stats', {})
+                    st = getattr(machine, '_motion_stats', {}).get('stats') or {}
                     delta = (int(st.get('XEND', 0)), int(st.get('YEND', 0)))
                     if (last_delta is not None
                             and abs(delta[0] - last_delta[0]) <= REPEAT_TOL_STEPS

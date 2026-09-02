@@ -8,7 +8,7 @@ SPDX-License-Identifier:    MIT
 Host tests for the pulse feeder: a print can be several times longer than
 the kernel ring, so the ring is a window onto the job rather than the place
 the job lives. These drive the feeder against a fake ring that refuses with
--ENOMEM when full and drains on demand, which is the only behaviour of the
+-ENOMEM when full and drains on demand, which is the only behavior of the
 device the feeder depends on.
 
 Run:  PYTHONPATH=.:../Glowforge-Utilities python3 -m unittest tests.test_feeder
@@ -129,7 +129,7 @@ class FeederTest(unittest.TestCase):
         self.assertEqual(bytes(ring.accepted), payload)
         self.assertEqual(feeder.written, len(payload))
         # Never declared live: end-of-data means the job finished, which is
-        # exactly the behaviour a job that fits has always had.
+        # exactly the behavior a job that fits has always had.
         self.assertFalse(feeder.streaming)
         self.assertEqual(CNC.streaming_writes, [])
 

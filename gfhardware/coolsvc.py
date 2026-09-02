@@ -22,7 +22,11 @@ VERDICT_MAX_AGE_S = 2.0
 REPORT_PERIOD_S = 1.0
 # localhost: anything slower means forgectrl is wedged - drop the
 # report, the level-triggered refresh retries in a second.
-REPORT_TIMEOUT_S = 0.25
+# The engine stands the fire gate down after 5 s without a report. The
+# reporter has its own thread, so the timeout can take most of one
+# report period: a slow answer from the daemon (a snapshot's encode on
+# the single core) costs one report, not five.
+REPORT_TIMEOUT_S = 1.0
 # The run airflow a controller writes itself, once, when the verdict goes
 # stale while the laser is armed: the engine is gone with the laser hot,
 # and these are writes nobody else will make now. The same duties the

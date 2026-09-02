@@ -145,7 +145,8 @@ def main() -> int:
     # Machine() reads the OCOTP identity and head info; it fails cleanly if
     # grblHAL still holds /dev/glowforge (controller_mode must be cloud).
     try:
-        machine = ffmachine.build_emulator(EMULATOR_DIR, EMULATOR_WORK) if emulate             else ffmachine.build_machine()
+        machine = ffmachine.build_emulator(EMULATOR_DIR, EMULATOR_WORK) if emulate \
+            else ffmachine.build_machine()
     except Exception:
         logger.exception('machine init failed (is grblHAL still running? '
                          'controller_mode must be cloud)')

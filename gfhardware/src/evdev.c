@@ -47,7 +47,7 @@ static PyObject * device_read(PyObject *self, PyObject *args)
     struct input_event event;
 
     // get device file descriptor (O_RDONLY|O_NONBLOCK)
-    if (PyArg_ParseTuple(args, "i", &fd) < 0)
+    if (!PyArg_ParseTuple(args, "i", &fd))
         return NULL;
 
     int n = read(fd, &event, sizeof(event));
@@ -97,7 +97,9 @@ static PyObject * device_read_many(PyObject *self, PyObject *args)
     ssize_t nread = read(fd, event, event_size*64);
 
     if (nread < 0) {
-        PyErr_SetFromErrno(PyExc_IOError);
+        if (errno == EAGAIN)
+            return PyList_New(0);       /* no events: an empty batch, not an error */
+        PyErr_SetFromErrno(PyExc_OSError);
         return NULL;
     }
 
@@ -148,6 +150,7 @@ static PyObject * ioctl_EVIOCG_bits(PyObject *self, PyObject *args)
     case EV_SW:
         max = SW_MAX; break;
     default:
+        PyErr_SetString(PyExc_ValueError, "unsupported event type");
         return NULL;
     }
 
@@ -161,12 +164,14 @@ static PyObject * ioctl_EVIOCG_bits(PyObject *self, PyObject *args)
     }
 
     if (ret == -1)
-        return NULL;
+        return PyErr_SetFromErrno(PyExc_OSError);
 
     PyObject* res = PyList_New(0);
     for (int i=0; i<max; i++) {
         if (test_bit(bytes, i)) {
-            PyList_Append(res, Py_BuildValue("i", i));
+            PyObject *bit = PyLong_FromLong(i);
+            PyList_Append(res, bit);
+            Py_DECREF(bit);
         }
     }
 

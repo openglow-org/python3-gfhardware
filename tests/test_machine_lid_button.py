@@ -907,7 +907,7 @@ class JobLifecycleTests(unittest.TestCase):
 
     def test_the_factory_periods_are_the_defaults(self):
         # Nothing configured: the machine still does what the factory does,
-        # measured on its own factory slot.
+        #.
         self.assertEqual(self.m._dwell('warm_up'), machine_mod.WARM_UP_DEFAULT_S)
         self.assertEqual(self.m._dwell('cool_down'), machine_mod.COOL_DOWN_DEFAULT_S)
         self.assertEqual(self.slept, [machine_mod.WARM_UP_DEFAULT_S,

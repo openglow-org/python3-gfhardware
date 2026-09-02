@@ -14,6 +14,7 @@ setup(
     long_description=open('README.md').read(),
     keywords='Glowforge OpenGlow OV5648 imx6',
     packages=['gfhardware', 'gfhardware.input', 'gfhardware.utils'],
+    install_requires=['gfutilities', 'requests'],
     ext_modules=[
         Extension(
             name='gfhardware._cam',

@@ -6,11 +6,10 @@ SPDX-License-Identifier:    MIT
 
 Machine identity, derived from the i.MX6 OCOTP fuses.
 
-The factory 4.14 vendor kernel exposed the fuses through the NXP fsl_otp
-driver (/sys/fsl_otp/HW_OCOTP_*); mainline 6.12 exposes the same fuse words
-only through nvmem. Both paths are tried (legacy first, so this module still
-works on a factory kernel), then the values can be overridden / provided by
-/etc/gfhardware-id.conf for machines whose fuses cannot be read.
+The fuse words are read through nvmem (imx-ocotp). The NXP fsl_otp sysfs
+path (/sys/fsl_otp/HW_OCOTP_*) is tried first, so the module also works on a
+factory kernel. /etc/gfhardware-id.conf can override or provide the values
+for a machine whose fuses cannot be read.
 
 nvmem layout (imx-ocotp): one 32-bit word per fuse, bank-major, 8 words per
 bank -> byte offset = (bank * 8 + word) * 4.

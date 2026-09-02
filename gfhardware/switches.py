@@ -9,6 +9,7 @@ Copyright (c) 2012-2016 Georgi Valkov. All rights reserved.
 
 """
 import logging
+from time import sleep
 import os
 import select
 from threading import Thread
@@ -82,11 +83,18 @@ class InputDevice(object):
 
         for event in events:
             sec, usec, e_type, code, val = tuple(event)
-            if e_type == 5:
-                code = InputSwitch(code)
-                val = True if int(val) == 1 else False
-            elif e_type == 0:
-                code = SynCode(code)
+            try:
+                if e_type == 5:
+                    code = InputSwitch(code)
+                    val = True if int(val) == 1 else False
+                elif e_type == 0:
+                    code = SynCode(code)
+            except ValueError:
+                # A code this map does not know is not an event of ours;
+                # it must not end the reader that carries the lid and the
+                # button.
+                logger.debug('ignoring unknown switch event %s/%s' % (e_type, code))
+                continue
             yield SwitchEvent(sec, usec, e_type, code, val)
 
     def switch_states(self) -> dict:
@@ -151,14 +159,22 @@ class SwitchMonitor(Thread):
 
     def run(self) -> None:
         logger.debug('THREAD START')
-        for event in self._input_dev.read_loop():
-            if event is not None:
-                if event.type == 5:
-                    self._event_handler(event)
-                elif event.type == 0 and event.code == SynCode.SYN_DROPPED:
-                    logger.error('switch monitor dropped events: %s' % str(event))
-            if self.stop:
-                break
+        # The button press reaches the run loop only through this thread,
+        # so it does not end on an exception: the fault is logged and the
+        # read loop is entered again.
+        while not self.stop:
+            try:
+                for event in self._input_dev.read_loop():
+                    if event is not None:
+                        if event.type == 5:
+                            self._event_handler(event)
+                        elif event.type == 0 and event.code == SynCode.SYN_DROPPED:
+                            logger.error('switch monitor dropped events: %s' % str(event))
+                    if self.stop:
+                        break
+            except Exception:
+                logger.exception('switch monitor failed; restarting the read loop')
+                sleep(0.5)
         logger.debug('THREAD EXIT')
 
     def switch_state(self, switch: InputSwitch) -> bool:

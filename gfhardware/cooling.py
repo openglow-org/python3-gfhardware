@@ -13,99 +13,6 @@ from gfhardware._common import *
 logger = logging.getLogger(LOGGER_NAME)
 
 
-class _FanController(object):
-    def __init__(self, fan_desc: dict):
-        self._max_pwm = fan_desc.get('max_pwm', 1)
-        self._min_pwm = fan_desc.get('min_pwm', 0)
-        self._pwm_path = fan_desc['pwm_path']
-        self._tach_path = fan_desc['tach_path']
-        self._tach_calc = fan_desc.get('tach_calc', None)
-
-    @property
-    def pwm(self) -> int:
-        return int(read_file(self._pwm_path))
-
-    def set_pwm(self, speed: int = None):
-        if speed > self._max_pwm or speed < self._min_pwm:
-            raise ValueError("Speed must be between {} and {}.".format(self._min_pwm, self._max_pwm))
-        write_file(self._pwm_path, str(speed))
-
-    @property
-    def tach(self) -> int:
-        val = int(read_file(self._tach_path))
-        if self._tach_calc is None:
-            return val
-        return self._tach_calc(val)
-
-    def off(self):
-        self.set_pwm(self._min_pwm)
-
-    @staticmethod
-    def fan_tach_2pole(ns_period: int) -> int:
-        if ns_period == 0:
-            return 0
-        return int(((1/(ns_period/1000000000))*60)/2)
-
-    @staticmethod
-    def fan_tach_8pole(ns_period: int) -> int:
-        if ns_period == 0:
-            return 0
-        return int(((1/(ns_period/1000000))*60)/8)
-
-
-class Fans(object):
-    def __init__(self):
-        self.exhaust = _FanController({
-            'max_pwm': 65535,
-            'pwm_path': SYSFS_GF_BASE + 'thermal/exhaust_pwm',
-            'tach_path': SYSFS_GF_BASE + 'thermal/tach_exhaust',
-            'tach_calc': _FanController.fan_tach_2pole,
-        })
-
-        self.intake_1 = _FanController({
-            'max_pwm': 65535,
-            'pwm_path': SYSFS_GF_BASE + 'thermal/intake_pwm',
-            'tach_path': SYSFS_GF_BASE + 'thermal/tach_intake_1',
-            'tach_calc': _FanController.fan_tach_2pole,
-        })
-
-        self.intake_2 = _FanController({
-            'max_pwm': 65535,
-            'pwm_path': SYSFS_GF_BASE + 'thermal/intake_pwm',
-            'tach_path': SYSFS_GF_BASE + 'thermal/tach_intake_2',
-            'tach_calc': _FanController.fan_tach_2pole,
-        })
-
-        self.air_assist = _FanController({
-            'max_pwm': 1023,
-            'min_pwm': 204,
-            'pwm_path': SYSFS_GF_BASE + 'head/air_assist_pwm',
-            'tach_path': SYSFS_GF_BASE + 'head/air_assist_tach',
-            'tach_calc': _FanController.fan_tach_8pole,
-        })
-
-        self.purge = _FanController({
-            'pwm_path': SYSFS_GF_BASE + 'head/purge_air',
-            'tach_path': SYSFS_GF_BASE + 'head/purge_air_current',
-        })
-
-    def reset(self):
-        self.exhaust.off()
-        self.intake_1.off()
-        self.air_assist.off()
-        self.purge.set_pwm(1)
-
-
-class TEC(object):
-    @staticmethod
-    def on():
-        write_file(SYSFS_GF_BASE + 'thermal/tec_on', '1')
-
-    @staticmethod
-    def off():
-        write_file(SYSFS_GF_BASE + 'thermal/tec_on', '0')
-
-
 class _TempSensor(object):
     def __init__(self, sensor_def: dict):
         self._sensor_path = sensor_def.get('sensor_path') or None
@@ -223,27 +130,15 @@ class _Temp(object):
 
 
 class WaterPump(object):
+    """The one thermal write this library keeps: the cooling engine in
+    forgectrl owns the pump, the fans, the TEC and the heater, and the
+    only thing the cloud client does to them is switch the heater off on
+    its way down."""
     @staticmethod
     def heater_off() -> None:
         write_file(SYSFS_GF_BASE + 'thermal/heater_pwm', '0')
 
-    @staticmethod
-    def on() -> None:
-        write_file(SYSFS_GF_BASE + 'thermal/water_pump_on', '1')
-
-    @staticmethod
-    def off() -> None:
-        write_file(SYSFS_GF_BASE + 'thermal/water_pump_on', '0')
-
-    @staticmethod
-    def set_heater(percentage: int) -> None:
-        if percentage < 0 or percentage > 100:
-            raise ValueError('heater_pwm percentage must be between 0 and 100, value: %s' % percentage)
-        write_attr(SYSFS_GF_BASE + 'thermal/heater_pwm', int(65535 * (percentage / 100)))
-
 
 temp_sensor = _Temp()
 
-fans = Fans()
-
-__all__ = ['fans', 'TEC', 'temp_sensor', 'WaterPump']
+__all__ = ['temp_sensor', 'WaterPump']

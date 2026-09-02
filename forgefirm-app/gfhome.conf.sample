@@ -39,9 +39,8 @@ max_start_temp: 27
 # Extra lens half-steps applied after the hunt (0 = hall reference).
 z_home_offset: 0
 # A print's warm-up and its rest, in seconds. The defaults are the factory's
-# own, measured on this board's factory slot: 3.05 s of warm-up between
-# configuring the run and starting it, and about 10.35 s of rest after the
-# park. The warm-up gets air and coolant moving before the first fire and the
+# own: 3.05 s of warm-up between configuring the run and starting it, and
+# about 10.35 s of rest after the park. The warm-up gets air and coolant moving before the first fire and the
 # rest purges the enclosure and the tube after the last one, so a machine
 # that skips them is running hardware the service assumes was looked after.
 # 0 skips either.
