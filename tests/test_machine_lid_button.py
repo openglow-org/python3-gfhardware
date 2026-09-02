@@ -86,6 +86,10 @@ class FakeCNC:
         self.streaming_writes = []
         # After this many state reads a live-fed run reports a dry ring.
         self.underrun_after = None
+        # After this many state reads the kernel faults out of the run.
+        self.fault_after = None
+        # The kernel refuses the stop (EPERM in a fault).
+        self.stop_error = None
 
     # -- attributes the Machine constructor maps pulse-header keys onto
     def set_step_freq(self, v): self.writes.append(('step_freq', v))
@@ -104,6 +108,8 @@ class FakeCNC:
         self._reads_left = self.run_reads
 
     def stop(self):
+        if self.stop_error is not None:
+            raise self.stop_error
         self.writes.append(('stop', 1))
         self._state = MachineState.IDLE
 
@@ -141,6 +147,11 @@ class FakeCNC:
                 self.underrun_after -= 1
                 if self.underrun_after <= 0:
                     self._state = MachineState.UNDERRUN
+                    return self._state
+            if self.fault_after is not None:
+                self.fault_after -= 1
+                if self.fault_after <= 0:
+                    self._state = MachineState.FAULT
                     return self._state
             self._reads_left -= 1
             if self._reads_left <= 0:
@@ -1324,3 +1335,95 @@ class FeederExitTests(unittest.TestCase):
         self.assertFalse(self.feeder.live)
         self._assert_feeder_stopped_before_the_park()
         self.assertIn('print:return_to_home:succeeded', job_events())
+
+
+class KernelFaultTests(unittest.TestCase):
+    """The kernel leaving a run on its own (a fault, a disable) is not the
+    program's end: the job is reported canceled, never completed, and the
+    safing that follows runs to the end even where the kernel refuses the
+    stop it starts with."""
+
+    def setUp(self):
+        CNC.__init__()
+        SW.__init__()
+        COOL.__init__()
+        del EVENTS[:]
+        self.m = make_machine()
+        SW.handler = self.m._switch_event
+        self.parks = []
+        machine_mod.generate_linear_puls = lambda x, y, dev: self.parks.append((x, y))
+
+    def tearDown(self):
+        machine_mod.generate_linear_puls = lambda x, y, dev: None
+
+    def test_a_fault_mid_run_is_an_abort(self):
+        CNC.fault_after = 3
+        aborted = self.m._run_loop()
+        self.assertTrue(aborted)
+        self.assertTrue(self.m._running_action_cancelled)
+
+    def test_a_fault_while_paused_is_an_abort(self):
+        SW.press(delay=0.05)                        # pause
+        threading.Timer(0.3, lambda: setattr(CNC, '_state', MachineState.FAULT)).start()
+        aborted = self.m._run_loop(pausable=True)
+        self.assertTrue(aborted)
+        self.assertTrue(self.m._running_action_cancelled)
+
+    def test_a_faulted_park_reports_no_success(self):
+        CNC.xy_steps = (500, 300)
+        CNC.fault_after = 2
+        self.m._return_home(None)
+        self.assertNotIn('print:return_to_home:succeeded', job_events())
+
+    def test_a_program_that_ends_is_not_an_abort(self):
+        CNC.run_reads = 3
+        self.assertFalse(self.m._run_loop())
+        self.assertFalse(self.m._running_action_cancelled)
+
+    def test_cleanup_runs_to_the_end_when_the_stop_is_refused(self):
+        CNC.stop_error = OSError(1, 'EPERM')
+        COOL.armed = True
+        COOL.mode = 'run'
+        self.m._feeder = FakeFeeder()
+        self.m._action_cleanup()
+        self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertFalse(COOL.armed)
+        self.assertEqual(COOL.mode, 'idle')
+        self.assertIsNone(self.m._feeder)
+        self.assertEqual(CNC.streaming_writes[-1], 0)
+
+    def test_shutdown_runs_to_the_end_when_the_stop_is_refused(self):
+        CNC.stop_error = OSError(1, 'EPERM')
+        COOL.armed = True
+        COOL.mode = 'run'
+        self.m._shutdown()
+        self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertFalse(COOL.armed)
+        self.assertEqual(COOL.mode, 'idle')
+        self.assertTrue(COOL.stop)
+
+    def test_shutdown_cancels_and_waits_for_the_running_action(self):
+        # A run in progress on the action thread when the process goes
+        # down: the thread is told to stop and is gone before the shutdown
+        # returns, and it parked nothing.
+        CNC.xy_steps = (500, 300)
+        done = []
+
+        def action():
+            self.m._run_loop()
+            self.m._return_home(None)
+            done.append(True)
+        t = threading.Thread(target=action, daemon=True)
+        self.m._action_thread = t
+        t.start()
+        time.sleep(0.15)
+        self.assertTrue(t.is_alive())
+        self.m._shutdown()
+        self.assertFalse(t.is_alive(), 'the action outlived the shutdown')
+        self.assertTrue(done)
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertEqual(self.parks, [])
+        self.assertEqual(CNC.writes.count(('run', 1)), 1)          # the job only
+        self.assertNotIn('print:return_to_home:succeeded', job_events())
+        self.assertIn(('stop', 1), CNC.writes)
+        self.assertIn(('laser_latch', 1), CNC.writes)

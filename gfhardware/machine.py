@@ -315,6 +315,9 @@ class Machine(BaseMachine):
         self._button_pressed: bool = False
         self._motion_stats: dict = {}
         self._feeder = None
+        # Set once the process is going down: a running action is told to
+        # stop, and the park that would follow its cancel is skipped.
+        self._shutting_down: bool = False
         self._sw_thread: SwitchMonitor = SwitchMonitor(SWITCH_DEVICE, self._switch_event)
         # Edge-to-run-loop signaling. The switch thread flags edges and
         # wakes the run loop; the run loop (the one owner of every cnc
@@ -472,16 +475,31 @@ class Machine(BaseMachine):
         mid-run, that close is what fires the kernel dead man's switch."""
         # cnc.stop() first: a crashed action must not leave the gantry
         # running the rest of the program unsupervised with only the beam
-        # latched off. A controlled stop is a no-op when already idle.
-        cnc.stop()
-        cnc.laser_latch(1)
-        head_all_led_off()
-        self._stop_feeder()
-        cnc.set_streaming(False)
-        cnc.set_pulse_dev(None)
-        cooling_svc.set_armed(False)
-        cooling_svc.set_mode('idle')
-        cooling_svc.clear_limits()
+        # latched off. A controlled stop is a no-op when already idle, and
+        # is refused in a kernel fault: every step here runs whatever the
+        # ones before it did, so the latch relock and the idle report
+        # never depend on the stop.
+        self._safe_steps('cleanup', (
+            ('stop motion', cnc.stop),
+            ('lock the laser latch', lambda: cnc.laser_latch(1)),
+            ('turn the head emitters off', head_all_led_off),
+            ('stop the pulse feeder', self._stop_feeder),
+            ('leave live-feed mode', lambda: cnc.set_streaming(False)),
+            ('drop the pulse device', lambda: cnc.set_pulse_dev(None)),
+            ('disarm the cooling engine', lambda: cooling_svc.set_armed(False)),
+            ('report idle to the cooling engine', lambda: cooling_svc.set_mode('idle')),
+            ('clear the job limits', cooling_svc.clear_limits),
+        ))
+
+    @staticmethod
+    def _safe_steps(what: str, steps) -> None:
+        """Run each (name, callable) in order; a step that raises is logged
+        and the rest still run. For the paths that put the machine safe."""
+        for name, step in steps:
+            try:
+                step()
+            except Exception:
+                logger.exception('%s: could not %s', what, name)
 
     def _initialize(self) -> None:
         logger.debug('initializing machine')
@@ -726,6 +744,11 @@ class Machine(BaseMachine):
         # park ran to completion (a kernel fault is the one thing that
         # ends it early).
         logger.info('start return home')
+        if self._shutting_down:
+            # The process is going down: no new motion. No success is
+            # reported; the service re-hunts on the next session.
+            logger.warning('return home skipped: shutting down')
+            return
         if self._feeder is not None:
             # Never with a feeder alive: it would refill the ring behind the
             # clear below, and the park would play the print's path. No
@@ -1129,7 +1152,16 @@ class Machine(BaseMachine):
                 break                       # the kernel faulted while held
             self._run_wake.wait(.1)
             self._run_wake.clear()
-        logger.info('current state: %s' % cnc.state)
+        end_state = cnc.state
+        logger.info('current state: %s' % end_state)
+        if not aborted and end_state is not MachineState.IDLE:
+            # The kernel left the run on its own (a fault, a disable): the
+            # program did not end, and the position is not to be trusted.
+            # Never ':completed' - the service would dead-reckon from it.
+            logger.error('run ended in kernel state %s; the job did not finish',
+                         end_state.name.lower())
+            self._running_action_cancelled = True
+            aborted = True
         set_button_color(ButtonColor.OFF)
         if progress is not None:
             # Where the job actually ended, whether that is the end of the
@@ -1165,11 +1197,30 @@ class Machine(BaseMachine):
         # kernel dead-man nor the close-relock fires on it. Stop motion
         # and lock the latch explicitly, then hand the cooling engine a
         # final disarmed/idle report so it stands down through cooldown.
-        cnc.stop()
-        cnc.laser_latch(1)
-        cooling_svc.set_armed(False)
-        cooling_svc.set_mode('idle')
-        cooling_svc.clear_limits()
+        # A running action is told to stop first and waited for: left to
+        # itself it would read the stopped kernel as its program's end
+        # and park after this stop, and the park would race the exit.
+        # Every step runs whatever the ones before it did (the stop is
+        # refused in a kernel fault).
+        self._shutting_down = True
+        self._running_action_cancelled = True
+        self._run_wake.set()
+        self._safe_steps('shutdown', (
+            ('stop motion', cnc.stop),
+            ('lock the laser latch', lambda: cnc.laser_latch(1)),
+        ))
+        thread = getattr(self, '_action_thread', None)
+        if thread is not None and thread.is_alive():
+            logger.info('waiting for the running action to stop')
+            thread.join(10.0)
+            if thread.is_alive():
+                logger.error('the running action did not stop')
+        self._safe_steps('shutdown', (
+            ('lock the laser latch', lambda: cnc.laser_latch(1)),
+            ('disarm the cooling engine', lambda: cooling_svc.set_armed(False)),
+            ('report idle to the cooling engine', lambda: cooling_svc.set_mode('idle')),
+            ('clear the job limits', cooling_svc.clear_limits),
+        ))
         cooling_svc.stop = True
         self._sw_thread.stop = True
         logger.info('joining switch thread')
