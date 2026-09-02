@@ -11,7 +11,7 @@ import time
 from threading import Thread, Lock
 from urllib import parse, request
 
-from gfhardware._common import LOGGER_NAME
+from gfhardware._common import LOGGER_NAME, SYSFS_GF_BASE, write_file
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -23,6 +23,13 @@ REPORT_PERIOD_S = 1.0
 # localhost: anything slower means forgectrl is wedged - drop the
 # report, the level-triggered refresh retries in a second.
 REPORT_TIMEOUT_S = 0.25
+# The run airflow a controller writes itself, once, when the verdict goes
+# stale while the laser is armed: the engine is gone with the laser hot,
+# and these are writes nobody else will make now. The same duties the
+# GRBL controller falls back to.
+FALLBACK_AIRFLOW = (('head/air_assist_pwm', '1023'),
+                    ('thermal/exhaust_pwm', '65535'),
+                    ('thermal/intake_pwm', '43278'))
 
 # The job's operating envelope, as far as this machine carries it to the
 # engine: the pulse-header tags that bound a gate the engine has or is
@@ -193,6 +200,27 @@ class CoolingService(Thread):
     def fire_ok(self) -> bool:
         v = self.verdict()
         return bool(v and v.get('fire_ok'))
+
+    def hold(self) -> bool:
+        """The engine asks for a hold. A missing or stale verdict holds."""
+        v = self.verdict()
+        return v is None or bool(v.get('hold', True))
+
+    def resume_ok(self) -> bool:
+        """The engine offers the resume from its hold. Never on a missing
+        or stale verdict, and never while it still asks for the hold."""
+        v = self.verdict()
+        return bool(v and v.get('resume_ok') and not v.get('hold', True))
+
+    @staticmethod
+    def fallback_airflow() -> None:
+        """The run airflow, written directly: for a verdict gone stale
+        while the laser is armed (the engine is gone with the laser hot)."""
+        for attr, duty in FALLBACK_AIRFLOW:
+            try:
+                write_file(SYSFS_GF_BASE + attr, duty)
+            except OSError as e:
+                logger.error('fallback airflow: cannot write %s: %s', attr, e)
 
 
 cooling_svc = CoolingService()

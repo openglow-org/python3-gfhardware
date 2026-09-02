@@ -252,15 +252,40 @@ class FakeSwitches:
 
 
 class FakeCooling:
+    """The engine's verdict as the fake sees it: fire_ok, and a hold that
+    follows it unless a test says otherwise (the engine never blocks fire
+    without asking for a hold); resume_ok is the hold's complement. stale
+    stands for a missing or outdated verdict file."""
+
     def __init__(self):
         self.armed = False
         self.mode = 'idle'
         self._fire_ok = True
+        self._hold = None
+        self.stale = False
+        self.name = 'OK'
+        self.fallbacks = 0
 
     def set_armed(self, a): self.armed = bool(a)
     def set_mode(self, m): self.mode = m
-    def fire_ok(self): return self._fire_ok
-    def verdict(self): return {'fire_ok': self._fire_ok}
+    def fire_ok(self): return not self.stale and self._fire_ok
+
+    def verdict(self):
+        if self.stale:
+            return None
+        hold = (not self._fire_ok) if self._hold is None else self._hold
+        return {'fire_ok': self._fire_ok, 'hold': hold, 'resume_ok': not hold,
+                'verdict': self.name, 'reason': ''}
+
+    def hold(self):
+        v = self.verdict()
+        return v is None or v['hold']
+
+    def resume_ok(self):
+        v = self.verdict()
+        return bool(v and v['resume_ok'])
+
+    def fallback_airflow(self): self.fallbacks += 1
     def clear_profile(self): pass
     def set_limits(self, limits): self.limits = dict(limits)
     def clear_limits(self): self.limits = {}
@@ -509,13 +534,21 @@ class RunLoopTests(unittest.TestCase):
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('stop', 1), CNC.writes)
 
-    def test_cooling_verdict_pulled_relocks_and_stops(self):
+    def test_cooling_verdict_pulled_relocks_and_holds(self):
+        # fire_ok false, hold true (OVERTEMP, COLD, WARMUP, FLAME, BUMP):
+        # the latch at once, then the same pause as the button's.
         threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
+        threading.Timer(0.6, lambda: setattr(self.m, '_running_action_cancelled', True)).start()
         COOL.armed = True
-        aborted = self.m._run_loop()
+        aborted = self.m._run_loop(pausable=True)
         self.assertTrue(aborted)
-        self.assertIn(('laser_latch', 1), CNC.writes)
-        self.assertIn(('stop', 1), CNC.writes)
+        w = CNC.writes
+        self.assertIn(('laser_latch', 1), w)
+        self.assertIn(('stop', 1), w)
+        self.assertIn(('resume', -2000), w)
+        self.assertLess(w.index(('laser_latch', 1)), w.index(('stop', 1)))
+        self.assertNotIn(('laser_latch', 0), w)
+        self.assertIn('print:paused', job_events())
 
     # -- button pause / resume (prints) --------------------------------
 
@@ -1266,7 +1299,7 @@ class FeederExitTests(unittest.TestCase):
         self.assertEqual(self.parks, [(-500, -300)])
 
     def test_a_blocked_verdict_stops_the_feeder(self):
-        COOL._fire_ok = False
+        COOL.stale = True
         CNC.xy_steps = (0, 0)
         self.m._motion_locked(self._print(), None)
         self.assertTrue(self.m._running_action_cancelled)
@@ -1426,4 +1459,189 @@ class KernelFaultTests(unittest.TestCase):
         self.assertEqual(CNC.writes.count(('run', 1)), 1)          # the job only
         self.assertNotIn('print:return_to_home:succeeded', job_events())
         self.assertIn(('stop', 1), CNC.writes)
+        self.assertIn(('laser_latch', 1), CNC.writes)
+
+
+class VerdictHoldTests(unittest.TestCase):
+    """The cooling-engine contract in cloud mode: fire_ok is the latch,
+    hold is a pause, resume_ok the resume, a hold with no end a cancel, and
+    a verdict gone missing the emergency posture."""
+
+    def setUp(self):
+        CNC.__init__()
+        SW.__init__()
+        COOL.__init__()
+        del EVENTS[:]
+        self.m = make_machine()
+        SW.handler = self.m._switch_event
+        COOL.armed = True
+        self._conf = machine_mod._conf_float
+        machine_mod._conf_float = lambda key, default: (
+            60.0 if key == 'cloud_hold_max_s' else self._conf(key, default))
+        self.heater_offs = 0
+        self._heater_off = machine_mod.WaterPump.heater_off
+        machine_mod.WaterPump.heater_off = staticmethod(lambda: setattr(self, 'heater_offs', self.heater_offs + 1))
+
+    def tearDown(self):
+        machine_mod._conf_float = self._conf
+        machine_mod.WaterPump.heater_off = self._heater_off
+
+    def _release(self):
+        COOL._fire_ok = True
+        COOL._hold = False
+
+    def test_a_hold_pauses_and_the_resume_brings_the_laser_back(self):
+        threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
+        threading.Timer(0.40, self._release).start()
+        threading.Timer(0.70, lambda: setattr(CNC, '_reads_left', 1)).start()
+        aborted = self.m._run_loop(pausable=True)
+        self.assertFalse(aborted)
+        self.assertFalse(self.m._running_action_cancelled)
+        w = CNC.writes
+        self.assertIn(('laser_latch', 1), w)
+        self.assertIn(('resume', -2000), w)
+        self.assertIn(('laser_latch', 0), w)
+        self.assertIn(('resume', 1950), w)
+        self.assertLess(w.index(('laser_latch', 0)), w.index(('resume', 1950)))
+        self.assertEqual([e for e in job_events() if e in ('print:paused', 'print:resumed')],
+                         ['print:paused', 'print:resumed'])
+
+    def test_a_hold_with_fire_permitted_pauses_without_the_latch(self):
+        # SUSPECT: hold asked, fire still permitted. The pause, not the latch.
+        threading.Timer(0.05, lambda: setattr(COOL, '_hold', True)).start()
+        threading.Timer(0.40, self._release).start()
+        threading.Timer(0.70, lambda: setattr(CNC, '_reads_left', 1)).start()
+        aborted = self.m._run_loop(pausable=True)
+        self.assertFalse(aborted)
+        w = CNC.writes
+        self.assertIn(('resume', -2000), w)
+        self.assertIn(('resume', 1950), w)
+        self.assertNotIn(('laser_latch', 1), w)
+
+    def test_a_hold_past_its_bound_cancels(self):
+        machine_mod._conf_float = lambda key, default: (
+            0.3 if key == 'cloud_hold_max_s' else self._conf(key, default))
+        # the bound is clamped to 60 s and up: patch the reader the loop uses
+        self.m._hold_max_s = lambda: 0.3
+        threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
+        aborted = self.m._run_loop(pausable=True)
+        self.assertTrue(aborted)
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertNotIn(('resume', 1950), CNC.writes)
+
+    def test_the_lid_ends_a_verdict_hold(self):
+        threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
+        SW.open_lid(delay=0.4)
+        aborted = self.m._run_loop(pausable=True)
+        self.assertTrue(aborted)
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertEqual(CNC.writes.count(('stop', 1)), 1)     # the hold's stop, no second
+
+    def test_a_lost_verdict_holds_and_falls_back(self):
+        threading.Timer(0.05, lambda: setattr(COOL, 'stale', True)).start()
+        threading.Timer(0.40, lambda: setattr(COOL, 'stale', False)).start()
+        threading.Timer(0.70, lambda: setattr(CNC, '_reads_left', 1)).start()
+        aborted = self.m._run_loop(pausable=True)
+        self.assertFalse(aborted)
+        self.assertEqual(self.heater_offs, 1)
+        self.assertEqual(COOL.fallbacks, 1)
+        w = CNC.writes
+        self.assertIn(('laser_latch', 1), w)
+        self.assertIn(('resume', -2000), w)
+        self.assertIn(('laser_latch', 0), w)
+        self.assertIn(('resume', 1950), w)
+
+    def test_the_button_does_not_resume_under_a_hold(self):
+        SW.press(delay=0.05)                         # pause
+        threading.Timer(0.20, lambda: setattr(COOL, '_hold', True)).start()
+        SW.press(delay=0.40)                         # a resume the engine forbids
+        threading.Timer(0.70, self._release).start()
+        threading.Timer(1.00, lambda: setattr(CNC, '_reads_left', 1)).start()
+        aborted = self.m._run_loop(pausable=True)
+        self.assertFalse(aborted)
+        w = CNC.writes
+        self.assertEqual(w.count(('resume', 1950)), 1)
+        self.assertEqual(w.count(('resume', -2000)), 1)
+
+    def test_an_engine_stop_short_of_the_program_is_not_a_finish(self):
+        # A fail tier (FIRE, CRASH) stops the kernel itself: idle, short of
+        # the program. Never ':completed'.
+        CNC.run_reads = 3
+        CNC.processed = 100
+        real_state = type(CNC).state
+        def state(self_):
+            s = real_state.fget(self_)
+            if s is MachineState.IDLE:
+                self_.processed = 100
+            return s
+        type(CNC).state = property(state)
+        try:
+            aborted = self.m._run_loop()
+        finally:
+            type(CNC).state = real_state
+        self.assertTrue(aborted)
+        self.assertTrue(self.m._running_action_cancelled)
+
+    def test_a_motion_is_not_held_on_the_verdict(self):
+        COOL.armed = False
+        COOL._fire_ok = False
+        CNC.run_reads = 3
+        self.assertFalse(self.m._run_loop())
+        self.assertNotIn(('laser_latch', 1), CNC.writes)
+
+
+class VerdictWaitTests(unittest.TestCase):
+    """Before the run: a print armed under a hold (WARMUP, COLD) waits for
+    the engine to release it; only an absent engine refuses to arm."""
+
+    def setUp(self):
+        CNC.__init__()
+        SW.__init__()
+        COOL.__init__()
+        del EVENTS[:]
+        self.m = make_machine()
+        SW.handler = self.m._switch_event
+        self._conf = machine_mod._conf_float
+
+    def tearDown(self):
+        machine_mod._conf_float = self._conf
+
+    def test_a_hold_is_waited_out(self):
+        COOL._fire_ok = False
+        COOL.name = 'WARMUP'
+        threading.Timer(0.3, lambda: (setattr(COOL, '_fire_ok', True), setattr(COOL, 'name', 'OK'))).start()
+        t0 = time.monotonic()
+        self.m._verdict_wait()
+        self.assertGreater(time.monotonic() - t0, 0.25)
+        self.assertFalse(self.m._running_action_cancelled)
+        self.assertNotIn(('laser_latch', 1), CNC.writes)
+
+    def test_a_clean_verdict_does_not_wait(self):
+        t0 = time.monotonic()
+        self.m._verdict_wait()
+        self.assertLess(time.monotonic() - t0, 0.1)
+
+    def test_the_lid_ends_the_wait(self):
+        COOL._fire_ok = False
+        COOL.armed = True
+        SW.open_lid(delay=0.05)
+        self.m._verdict_wait()
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertFalse(COOL.armed)
+
+    def test_a_lost_verdict_ends_the_wait(self):
+        COOL._fire_ok = False
+        COOL.armed = True
+        threading.Timer(0.1, lambda: setattr(COOL, 'stale', True)).start()
+        self.m._verdict_wait()
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertIn(('laser_latch', 1), CNC.writes)
+
+    def test_the_bound_ends_the_wait(self):
+        self.m._hold_max_s = lambda: 0.2
+        COOL._fire_ok = False
+        COOL.armed = True
+        self.m._verdict_wait()
+        self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('laser_latch', 1), CNC.writes)
