@@ -1141,3 +1141,186 @@ class ProgressTests(unittest.TestCase):
         CNC.run_reads = 3
         self.m._run_loop()
         self.assertEqual(self.frames(), [])
+
+
+class FeederExitTests(unittest.TestCase):
+    """A job longer than the ring keeps its feeder alive, parked on a full
+    ring with the rest of the print in hand. Every way out of the job has
+    to stop that feeder before the park clears the ring: a feeder left
+    alive would refill the ring behind the clear, and the park (which
+    ignores the lid and the cancel flag by design) would play the print's
+    path. The whole job body runs here, against a feeder stand-in that
+    records its stop among the kernel writes so the order can be checked."""
+
+    class Source:
+        body_size = 0
+        program_size = 5000
+
+        def read(self, n):
+            return b''
+
+    class JobFeeder(FakeFeeder):
+        """Records its stop among the cnc writes, as the order against the
+        park's clear is the point."""
+
+        def __init__(self, finished):
+            FakeFeeder.__init__(self, written=100, finished=finished)
+            self.stats = {}
+            self.job_total = 5000
+            self.live = False
+
+        def start(self):
+            pass
+
+        def wait_primed(self, timeout=120.0):
+            return True
+
+        def declare_live_feed(self):
+            self.live = True
+
+        def settle(self, timeout=60.0):
+            return True
+
+        def stop(self, timeout=5.0):
+            FakeFeeder.stop(self, timeout)
+            CNC.writes.append(('feeder_stop', 1))
+
+    def setUp(self):
+        CNC.__init__()
+        SW.__init__()
+        COOL.__init__()
+        del EVENTS[:]
+        self.m = make_machine()
+        SW.handler = self.m._switch_event
+        self.feeder = None
+        self.long_job = True
+        self._fetch = machine_mod.fetch_motion
+        self._feeder_cls = machine_mod.PulseFeeder
+        self._sleep = machine_mod.sleep
+        self._conf = machine_mod._conf_float
+        machine_mod.fetch_motion = lambda s, url, warn_bytes=0, reject_bytes=0: (
+            {'header_data': {'STfr': 10000}}, self.Source())
+        machine_mod.PulseFeeder = self._make_feeder
+        machine_mod.sleep = lambda s: None
+        self.parks = []
+        machine_mod.generate_linear_puls = lambda x, y, dev: self.parks.append((x, y))
+
+    def tearDown(self):
+        machine_mod.fetch_motion = self._fetch
+        machine_mod.PulseFeeder = self._feeder_cls
+        machine_mod.sleep = self._sleep
+        machine_mod._conf_float = self._conf
+        machine_mod.generate_linear_puls = lambda x, y, dev: None
+
+    def _make_feeder(self, source, dev):
+        self.feeder = self.JobFeeder(finished=not self.long_job)
+        return self.feeder
+
+    @staticmethod
+    def _print():
+        return {'id': 42, 'action_type': 'print', 'motion_url': 'x'}
+
+    def _assert_feeder_stopped_before_the_park(self):
+        w = CNC.writes
+        self.assertTrue(self.feeder.stopped, 'the feeder was left alive')
+        self.assertIsNone(self.m._feeder)
+        self.assertIn(('feeder_stop', 1), w)
+        if ('clear_pulse', 1) in w:
+            self.assertLess(w.index(('feeder_stop', 1)), w.index(('clear_pulse', 1)),
+                            'the park cleared the ring with the feeder alive')
+
+    def test_a_cancel_at_the_button_wait_stops_the_feeder_before_the_park(self):
+        # A two-hour print, ring full, the operator opens the lid while the
+        # button is waited for. The park must find no feeder.
+        CNC.xy_steps = (0, 0)
+        SW.open_lid(delay=0.05)
+        self.m._motion_locked(self._print(), None)
+        self.assertTrue(self.m._running_action_cancelled)
+        self._assert_feeder_stopped_before_the_park()
+        self.assertNotIn(('run', 1), CNC.writes)
+        self.assertNotIn('print:running', job_events())
+        self.assertEqual(self.parks, [])
+
+    def test_a_cancel_at_the_button_wait_off_the_start_parks_after_the_feeder(self):
+        # The same cancel with the head off the start (a hunt moved it): the
+        # park runs, and only after the feeder is gone and the ring cleared.
+        CNC.xy_steps = (500, 300)
+        CNC.run_reads = 3
+        SW.open_lid(delay=0.05)
+        self.m._motion_locked(self._print(), None)
+        self._assert_feeder_stopped_before_the_park()
+        w = CNC.writes
+        self.assertIn(('run', 1), w)
+        self.assertLess(w.index(('feeder_stop', 1)), w.index(('run', 1)))
+        self.assertEqual(self.parks, [(-500, -300)])
+
+    def test_a_blocked_verdict_stops_the_feeder(self):
+        COOL._fire_ok = False
+        CNC.xy_steps = (0, 0)
+        self.m._motion_locked(self._print(), None)
+        self.assertTrue(self.m._running_action_cancelled)
+        self._assert_feeder_stopped_before_the_park()
+        self.assertNotIn(('laser_latch', 0), CNC.writes)
+        self.assertNotIn(('run', 1), CNC.writes)
+
+    def test_a_timed_out_button_wait_stops_the_feeder(self):
+        machine_mod._conf_float = lambda key, default: (
+            1.0 if key == 'laser_button_timeout_s' else self._conf(key, default))
+        CNC.xy_steps = (0, 0)
+        self.m._motion_locked(self._print(), None)
+        self.assertTrue(self.m._running_action_cancelled)
+        self._assert_feeder_stopped_before_the_park()
+        self.assertNotIn(('run', 1), CNC.writes)
+
+    def test_a_crash_mid_job_stops_the_feeder(self):
+        # An exception between the button and the run (here the warm-up
+        # dwell) leaves through the same finally: the feeder is gone before
+        # the action thread's cleanup ever sees it.
+        def boom(s):
+            raise RuntimeError('dwell failed')
+        machine_mod.sleep = boom
+        SW.press(delay=0.05)
+        with self.assertRaises(RuntimeError):
+            self.m._motion_locked(self._print(), None)
+        self.assertTrue(self.feeder.stopped)
+        self.assertIsNone(self.m._feeder)
+
+    def test_the_park_refuses_a_live_feeder(self):
+        # Whatever leaves a feeder alive, the park stops it and does not
+        # run. No success is reported; the service re-hunts.
+        CNC.xy_steps = (500, 300)
+        feeder = self.JobFeeder(finished=False)
+        self.m._feeder = feeder
+        self.m._return_home(None)
+        self.assertTrue(feeder.stopped)
+        self.assertIsNone(self.m._feeder)
+        self.assertNotIn(('clear_pulse', 1), CNC.writes)
+        self.assertNotIn(('run', 1), CNC.writes)
+        self.assertEqual(self.parks, [])
+        self.assertEqual(job_events(), [])
+
+    def test_a_long_print_that_runs_to_the_end_parks_after_its_feed(self):
+        # The ordinary path through the same code: button pressed, the run
+        # plays out, the feed is declared live and stopped before the park.
+        CNC.xy_steps = (500, 300)
+        CNC.run_reads = 3
+        SW.press(delay=0.05)
+        self.m._motion_locked(self._print(), None)
+        self.assertFalse(self.m._running_action_cancelled)
+        self.assertTrue(self.feeder.live)
+        self._assert_feeder_stopped_before_the_park()
+        w = CNC.writes
+        self.assertEqual(w.count(('run', 1)), 2)          # the job, then the park
+        self.assertIn('print:running', job_events())
+        self.assertIn('print:return_to_home:succeeded', job_events())
+        self.assertEqual(self.parks, [(-500, -300)])
+
+    def test_a_print_that_fits_the_ring_is_unchanged(self):
+        self.long_job = False
+        CNC.xy_steps = (500, 300)
+        CNC.run_reads = 3
+        SW.press(delay=0.05)
+        self.m._motion_locked(self._print(), None)
+        self.assertFalse(self.feeder.live)
+        self._assert_feeder_stopped_before_the_park()
+        self.assertIn('print:return_to_home:succeeded', job_events())

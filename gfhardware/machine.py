@@ -476,9 +476,7 @@ class Machine(BaseMachine):
         cnc.stop()
         cnc.laser_latch(1)
         head_all_led_off()
-        if self._feeder is not None:
-            self._feeder.stop()
-            self._feeder = None
+        self._stop_feeder()
         cnc.set_streaming(False)
         cnc.set_pulse_dev(None)
         cooling_svc.set_armed(False)
@@ -590,6 +588,46 @@ class Machine(BaseMachine):
         # that cannot be loaded fails before the laser is ever armed.
         self._feeder = PulseFeeder(source, pulse_dev)
         self._feeder.start()
+        try:
+            self._feed_and_run(msg, source, lid_gated)
+        finally:
+            # On every way out, the cancel paths included. A job longer than
+            # the ring leaves its feeder parked on a full ring with the rest
+            # of the print in hand; left alive, it would refill the ring the
+            # park clears, and the park would play the print's path.
+            self._stop_feeder()
+
+        # Cool down for prints
+        if msg['action_type'] == 'print':
+            self._return_home(pulse_dev)
+            logger.info('start cool down')
+            self._config_from_pulse('cool_down', self._motion_stats['header_data'])
+            cooling_svc.set_mode('cooldown')
+            self._dwell('cool_down')
+            logger.info('end cool-down temps: %s' % str(temp_sensor.all))
+
+        # Config for idle
+        logger.info('start idle')
+        self._config_from_pulse('idle', self._motion_stats['header_data'])
+        cooling_svc.set_mode('idle')
+        cooling_svc.clear_profile()
+        cooling_svc.clear_limits()
+        pos = cnc.position
+        logger.info('end positions (%s, %s, %s)' % (pos.x.steps, pos.y.steps, pos.z.steps))
+
+    def _stop_feeder(self) -> None:
+        """Stop and drop the pulse feeder, if one is alive. Safe to repeat."""
+        feeder, self._feeder = self._feeder, None
+        if feeder is not None:
+            feeder.stop()
+
+    def _feed_and_run(self, msg: dict, source, lid_gated: bool) -> None:
+        """The job from its first byte in the ring to the end of its run.
+
+        Runs with the feeder alive. The caller stops the feeder on every
+        exit, so this body only has to leave the cancel flag set when the
+        job is not to run.
+        """
         if not self._feeder.wait_primed():
             logger.error('could not load the job into the ring: %s',
                          self._feeder.error)
@@ -680,24 +718,6 @@ class Machine(BaseMachine):
             if msg['action_type'] == 'print':
                 logger.info('end print temps: %s' % str(temp_sensor.all))
 
-        # Cool down for prints
-        if msg['action_type'] == 'print':
-            self._return_home(pulse_dev)
-            logger.info('start cool down')
-            self._config_from_pulse('cool_down', self._motion_stats['header_data'])
-            cooling_svc.set_mode('cooldown')
-            self._dwell('cool_down')
-            logger.info('end cool-down temps: %s' % str(temp_sensor.all))
-
-        # Config for idle
-        logger.info('start idle')
-        self._config_from_pulse('idle', self._motion_stats['header_data'])
-        cooling_svc.set_mode('idle')
-        cooling_svc.clear_profile()
-        cooling_svc.clear_limits()
-        pos = cnc.position
-        logger.info('end positions (%s, %s, %s)' % (pos.x.steps, pos.y.steps, pos.z.steps))
-
     def _return_home(self, pulse_dev) -> None:
         # The park is the response to an abort as much as to a finished
         # print, so it runs regardless of the cancel flag and regardless
@@ -706,6 +726,14 @@ class Machine(BaseMachine):
         # park ran to completion (a kernel fault is the one thing that
         # ends it early).
         logger.info('start return home')
+        if self._feeder is not None:
+            # Never with a feeder alive: it would refill the ring behind the
+            # clear below, and the park would play the print's path. No
+            # success is reported; the service re-hunts.
+            logger.error('return home: the pulse feeder is still running; '
+                         'stopping it and not parking')
+            self._stop_feeder()
+            return
         pos = cnc.position
         # The ring still holds whatever the job did not play: the rest of a
         # print aborted mid-run, or the whole print after a cancel at the
