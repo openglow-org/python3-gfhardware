@@ -255,7 +255,13 @@ class FakeCooling:
     """The engine's verdict as the fake sees it: fire_ok, and a hold that
     follows it unless a test says otherwise (the engine never blocks fire
     without asking for a hold); resume_ok is the hold's complement. stale
-    stands for a missing or outdated verdict file."""
+    stands for a missing or outdated verdict file.
+
+    The published armed flag is the engine's acknowledgment that it has
+    taken the reported armed window and applied the run airflow, so it
+    follows the reported state. Clearing ack models an engine that never
+    takes the job: the verdict then stays the one computed for the idle
+    session before the arm, which is what a caller must never fire on."""
 
     def __init__(self):
         self.armed = False
@@ -263,6 +269,7 @@ class FakeCooling:
         self._fire_ok = True
         self._hold = None
         self.stale = False
+        self.ack = True
         self.name = 'OK'
         self.fallbacks = 0
 
@@ -275,6 +282,7 @@ class FakeCooling:
             return None
         hold = (not self._fire_ok) if self._hold is None else self._hold
         return {'fire_ok': self._fire_ok, 'hold': hold, 'resume_ok': not hold,
+                'armed': self.armed and self.ack,
                 'verdict': self.name, 'reason': ''}
 
     def hold(self):
@@ -1607,6 +1615,7 @@ class VerdictWaitTests(unittest.TestCase):
         machine_mod._conf_float = self._conf
 
     def test_a_hold_is_waited_out(self):
+        COOL.armed = True
         COOL._fire_ok = False
         COOL.name = 'WARMUP'
         threading.Timer(0.3, lambda: (setattr(COOL, '_fire_ok', True), setattr(COOL, 'name', 'OK'))).start()
@@ -1617,9 +1626,40 @@ class VerdictWaitTests(unittest.TestCase):
         self.assertNotIn(('laser_latch', 1), CNC.writes)
 
     def test_a_clean_verdict_does_not_wait(self):
+        COOL.armed = True
         t0 = time.monotonic()
         self.m._verdict_wait()
         self.assertLess(time.monotonic() - t0, 0.1)
+
+    def test_an_unacknowledged_arm_does_not_start_the_run(self):
+        """The verdict must answer this armed session, not the idle one
+        before it. Everything here reads clean - fire_ok true, no hold -
+        and the only thing missing is the engine's acknowledgment that it
+        took the job and put the fans on the run profile. Starting on
+        that verdict is what puts the beam on the work with idle
+        airflow, so the wait must hold and then refuse."""
+        self.m._hold_max_s = lambda: 0.3
+        COOL.armed = True
+        COOL.ack = False
+        t0 = time.monotonic()
+        self.m._verdict_wait()
+        self.assertGreater(time.monotonic() - t0, 0.25)
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertFalse(COOL.armed)
+
+    def test_the_wait_ends_when_the_engine_takes_the_job(self):
+        """The acknowledgment arriving late is the ordinary case: the
+        engine sees the armed report on its next tick. The run starts
+        then, and not before."""
+        COOL.armed = True
+        COOL.ack = False
+        threading.Timer(0.3, lambda: setattr(COOL, 'ack', True)).start()
+        t0 = time.monotonic()
+        self.m._verdict_wait()
+        self.assertGreater(time.monotonic() - t0, 0.25)
+        self.assertFalse(self.m._running_action_cancelled)
+        self.assertNotIn(('laser_latch', 1), CNC.writes)
 
     def test_the_lid_ends_the_wait(self):
         COOL._fire_ok = False

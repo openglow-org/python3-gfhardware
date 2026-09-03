@@ -400,6 +400,13 @@ class Machine(BaseMachine):
         cloud_hold_max_s; the lid, the interlock loop, a service cancel,
         and a verdict that goes missing end it the way they end the
         button wait: latch relocked, disarmed, job canceled.
+
+        The engine's own armed flag is required before the verdict
+        counts as clean. Until the engine has seen the armed report and
+        applied the run airflow, the verdict on file is the one it
+        computed for the idle session before the arm, and at idle
+        nothing is wrong - so it says fire is fine while the fans are
+        still at their idle duty.
         """
         max_s = self._hold_max_s()
         deadline = monotonic() + max_s
@@ -409,7 +416,8 @@ class Machine(BaseMachine):
             v = cooling_svc.verdict()
             if v is None:
                 abort = 'cooling verdict lost'
-            elif not v.get('hold', True) and v.get('fire_ok'):
+            elif (not v.get('hold', True) and v.get('fire_ok')
+                    and v.get('armed')):
                 break
             elif self._running_action_cancelled:
                 abort = 'canceled'
