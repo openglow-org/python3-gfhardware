@@ -5,8 +5,10 @@ https://community.openglow.org
 SPDX-License-Identifier:    MIT
 """
 import fcntl
+import json
 import logging
 import os
+import time
 from threading import Event
 from time import monotonic, sleep
 from typing import Union
@@ -340,6 +342,7 @@ class Machine(BaseMachine):
         self._button_pressed: bool = False
         self._motion_stats: dict = {}
         self._feeder = None
+        self._captured = None
         # Set once the process is going down: a running action is told to
         # stop, and the park that would follow its cancel is skipped.
         self._shutting_down: bool = False
@@ -554,14 +557,26 @@ class Machine(BaseMachine):
         # A hunt is lens travel plus the service's XY hunt pattern; the
         # lid does not gate it (the factory runs a hunt with the lid open,
         # and the beam is blocked in hardware regardless).
+        if get_cfg('HOMING.HUNT_ACK_ONLY'):
+            # A GRBL homing session borrows the service for its camera
+            # homing only: the hunt is answered as done and nothing moves.
+            # The lens takes its own reference after the session, and the
+            # controller places it in Z from the focus card's numbers.
+            logger.info('hunt acknowledged without motion: the GRBL homing takes '
+                        'its own lens reference')
+            return
         ZAxis.home()
         self._motion(msg, lid_gated=False)
         home_offset = int(get_cfg('MOTION.Z_HOME_OFFSET') or 0)
         if home_offset != 0:
             logger.debug('moving z to home offset %s half steps' % home_offset)
             offset_dir = Dir.Pos if home_offset > 0 else Dir.Neg
-            for _ in range(abs(home_offset)):
-                ZAxis.step(offset_dir)
+            ZAxis.set_current(ZCur.HIGH)
+            try:
+                for _ in range(abs(home_offset)):
+                    ZAxis.step(offset_dir)
+            finally:
+                ZAxis.set_current(ZCur.LOW)
 
     def _action_cleanup(self) -> None:
         """Post-action failsafe hook (BaseMachine runs it even when an action
@@ -578,6 +593,8 @@ class Machine(BaseMachine):
         self._safe_steps('cleanup', (
             ('stop motion', cnc.stop),
             ('lock the laser latch', lambda: cnc.laser_latch(1)),
+            ('lock the lens out of the pulse path', lambda: cnc.set_motor_lock('8')),
+            ('rest the lens driver at its hold current', lambda: ZAxis.set_current(ZCur.LOW)),
             ('turn the head emitters off', head_all_led_off),
             ('stop the pulse feeder', self._stop_feeder),
             ('leave live-feed mode', lambda: cnc.set_streaming(False)),
@@ -668,6 +685,17 @@ class Machine(BaseMachine):
         # mode, where this job's ordinary end-of-data would read as a starved
         # ring. Start every job from the plain meaning.
         cnc.set_streaming(False)
+        # The service's motions carry the lens: a hunt steps it down from
+        # the hall reference and a print sets the focus for the material.
+        # Two things stand between the stream and the lens. The factory's
+        # idle config locks the lens out of the pulse path (motor_lock 8);
+        # it is lifted for the motion and put back after. And the head's Z
+        # driver rests at its hold current, at which the lens rises two
+        # steps into the service's ramp and stalls: the motion runs at the
+        # drive current, and the hold current returns at idle.
+        cnc.set_motor_lock('0')
+        ZAxis.enable()
+        ZAxis.set_current(ZCur.HIGH)
         # Download puls file from service. It stays in memory: the service
         # compresses the stream tens to one, so even a job hours long is a
         # few MB held, nothing written to the eMMC, and the ring is fed from
@@ -699,36 +727,102 @@ class Machine(BaseMachine):
         cooling_svc.set_limits(limits)
         logger.info('job limits from the header: %s',
                     ' '.join('%s=%s' % kv for kv in sorted(limits.items())) or 'none')
-        # Fill the ring before the operator is asked for the button, so a job
-        # that cannot be loaded fails before the laser is ever armed.
-        self._feeder = PulseFeeder(source, pulse_dev)
-        self._feeder.start()
-        try:
-            self._feed_and_run(msg, source, lid_gated)
-        finally:
-            # On every way out, the cancel paths included. A job longer than
-            # the ring leaves its feeder parked on a full ring with the rest
-            # of the print in hand; left alive, it would refill the ring the
-            # park clears, and the park would play the print's path.
-            self._stop_feeder()
+        capture = get_cfg('CAPTURE.HEADER_PATH') if msg['action_type'] == 'print' else None
+        if capture:
+            # The commissioning wizard asked for this one header: keep it
+            # for the daemon and cancel the print before anything arms.
+            # The file is written once the print's terminal event is on
+            # its way (motion()), so the daemon never sees the capture
+            # before the app is released.
+            self._capture_header(capture, msg, limits)
+            self._running_action_cancelled = True
+        else:
+            # Fill the ring before the operator is asked for the button, so a
+            # job that cannot be loaded fails before the laser is ever armed.
+            self._feeder = PulseFeeder(source, pulse_dev)
+            self._feeder.start()
+            try:
+                self._feed_and_run(msg, source, lid_gated)
+            finally:
+                # On every way out, the cancel paths included. A job longer
+                # than the ring leaves its feeder parked on a full ring with
+                # the rest of the print in hand; left alive, it would refill
+                # the ring the park clears, and the park would play the
+                # print's path.
+                self._stop_feeder()
 
-        # Cool down for prints
+        # Cool down for prints. A captured print never armed and never
+        # moved: the park reports at once and there is nothing to cool.
         if msg['action_type'] == 'print':
             self._return_home(pulse_dev)
-            logger.info('start cool down')
-            self._config_from_pulse('cool_down', self._motion_stats['header_data'])
-            cooling_svc.set_mode('cooldown')
-            self._dwell('cool_down')
-            logger.info('end cool-down temps: %s' % str(temp_sensor.all))
+            if capture:
+                logger.info('cool down skipped: the print was captured, not run')
+            else:
+                logger.info('start cool down')
+                self._config_from_pulse('cool_down', self._motion_stats['header_data'])
+                cooling_svc.set_mode('cooldown')
+                self._dwell('cool_down')
+                logger.info('end cool-down temps: %s' % str(temp_sensor.all))
 
         # Config for idle
         logger.info('start idle')
+        cnc.set_motor_lock('8')
+        ZAxis.set_current(ZCur.LOW)
         self._config_from_pulse('idle', self._motion_stats['header_data'])
         cooling_svc.set_mode('idle')
         cooling_svc.clear_profile()
         cooling_svc.clear_limits()
         pos = cnc.position
         logger.info('end positions (%s, %s, %s)' % (pos.x.steps, pos.y.steps, pos.z.steps))
+
+    def motion(self, msg: dict) -> None:
+        """A motion or print action, with the header capture's file written
+        after the action's terminal event is queued: the daemon that waits
+        for the file then knows the print is canceled on the wire, not only
+        here, and can leave cloud mode without cutting the event off."""
+        self._captured = None
+        try:
+            super().motion(msg)
+        finally:
+            captured, self._captured = self._captured, None
+            if captured is not None:
+                self._write_capture(*captured)
+
+    def _capture_header(self, path: str, msg: dict, limits: dict) -> None:
+        """One pulse header for the commissioning record: every scalar tag
+        the service sent, kept for the daemon (written by motion() once the
+        print's cancel is queued) and logged as one tagged block. The
+        request is one-shot: the setting that carried it is cleared here,
+        so the next print runs."""
+        header = self._motion_stats['header_data'] or {}
+        tags = {str(k): v for k, v in header.items()
+                if isinstance(v, (bool, int, float, str)) and not isinstance(v, bytes)}
+        doc = {
+            'captured': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            'job_id': msg.get('id'),
+            'tag_count': len(tags),
+            'tags': tags,
+            'limits': limits,
+        }
+        set_cfg('CAPTURE.HEADER_PATH', None)
+        self._captured = (path, doc)
+        logger.info('HEADER CAPTURE: %d tags of job %s; the print is canceled here',
+                    len(tags), msg.get('id'))
+        logger.info('HEADER CAPTURE tags: %s',
+                    ' '.join('%s=%s' % kv for kv in sorted(tags.items())))
+
+    @staticmethod
+    def _write_capture(path: str, doc: dict) -> None:
+        try:
+            tmp = path + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump(doc, f, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.error('HEADER CAPTURE: cannot write %s: %s', path, e)
+            return
+        logger.info('HEADER CAPTURE: %d tags of job %s -> %s', doc['tag_count'],
+                    doc.get('job_id'), path)
 
     def _stop_feeder(self) -> None:
         """Stop and drop the pulse feeder, if one is alive. Safe to repeat."""

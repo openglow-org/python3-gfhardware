@@ -9,6 +9,9 @@
 [SERVICE]
 server_url: https://app.glowforge.com
 status_service_url: wss://status.glowforge.com
+# The User-Agent the service sees. Unset = ForgeFIRM/<version>, the version
+# from the image stamp /etc/forgefirm-version.
+# user_agent: ForgeFIRM/0.0.1
 
 [FACTORY_FIRMWARE]
 # check: probe the firmware version the service advertises so forgectrl can
@@ -50,4 +53,4 @@ cool_down_delay: 10
 [FORGECTRL]
 # Camera captures fetch from the forgectrl daemon (it owns the camera
 # pipeline); direct V4L2 capture is the fallback.
-url: http://127.0.0.1:8080
+url: http://127.0.0.1

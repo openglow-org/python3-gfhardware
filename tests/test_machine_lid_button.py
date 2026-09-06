@@ -93,6 +93,7 @@ class FakeCNC:
 
     # -- attributes the Machine constructor maps pulse-header keys onto
     def set_step_freq(self, v): self.writes.append(('step_freq', v))
+    def set_motor_lock(self, v): self.writes.append(('motor_lock', str(v)))
     def set_x_decay(self, v): pass
     def set_x_current(self, v): pass
     def set_x_mode(self, v): pass
@@ -372,6 +373,14 @@ def _install_fakes():
 
         @staticmethod
         def reset(): pass
+
+        # The lens driver's writes land in the kernel wrapper's list, so a
+        # test can order them against the lock and the run.
+        @staticmethod
+        def enable(): cnc_mod.cnc.writes.append(('z_enable', 0))
+
+        @staticmethod
+        def set_current(cur): cnc_mod.cnc.writes.append(('z_current', cur.value))
     z_mod.ZAxis = ZAxis
 
     cam_mod = types.ModuleType('gfhardware.cam')
@@ -739,6 +748,20 @@ class StartGateTests(unittest.TestCase):
         SW.word[InputSwitch.SW_INTERLOCK] = True
         self.m._motion({'id': 42, 'action_type': 'print', 'motion_url': 'x'})
         self.assertTrue(self.m._running_action_cancelled)
+
+    def test_an_acknowledged_hunt_moves_nothing(self):
+        # A GRBL homing session answers the service's hunt as done: no lens
+        # home, no hunt file, no run. The lens reference is the runner's own,
+        # after the session.
+        homed = machine_mod.ZAxis.homed
+        set_cfg('HOMING.HUNT_ACK_ONLY', True)
+        try:
+            self.m._hunt({'id': 42, 'action_type': 'hunt', 'motion_url': 'x'})
+        finally:
+            set_cfg('HOMING.HUNT_ACK_ONLY', False)
+        self.assertEqual(machine_mod.ZAxis.homed, homed)
+        self.assertNotIn(('run', 1), CNC.writes)
+        self.assertNotIn(('motor_lock', '0'), CNC.writes)
 
     def test_hunt_start_gate_ignores_the_lid(self):
         SW.word[InputSwitch.SW_DOORS] = False
@@ -1280,6 +1303,35 @@ class FeederExitTests(unittest.TestCase):
         if ('clear_pulse', 1) in w:
             self.assertLess(w.index(('feeder_stop', 1)), w.index(('clear_pulse', 1)),
                             'the park cleared the ring with the feeder alive')
+
+    def test_the_lens_is_unlocked_and_driven_for_the_motion_and_rested_after(self):
+        # The service's Z steps must reach the lens: the lock the idle config
+        # sets (8) is lifted before the ring is fed and put back at idle, and
+        # the head's Z driver is enabled and set to its drive current (0)
+        # before the feed and rested at its hold current (1) at idle. At the
+        # hold current the lens rises two steps into the service's ramp and
+        # stalls, so the focus is never made.
+        CNC.xy_steps = (0, 0)
+        SW.open_lid(delay=0.05)
+        self.m._motion_locked(self._print(), None)
+        w = CNC.writes
+        for first, then in ((('motor_lock', '0'), ('motor_lock', '8')),
+                            (('z_current', 0), ('z_current', 1)),
+                            (('z_enable', 0), ('motor_lock', '8'))):
+            self.assertIn(first, w)
+            self.assertIn(then, w)
+            self.assertLess(w.index(first), w.index(then))
+        # The driver is at its drive current before any feed and any run.
+        self.assertLess(w.index(('z_current', 0)), w.index(('feeder_stop', 1)))
+        self.assertEqual(w.count(('z_current', 0)), 1)
+
+    def test_the_cleanup_locks_and_rests_the_lens(self):
+        # A crashed action leaves through the same posture as a finished
+        # one: the lens locked out of the pulse path at its hold current.
+        self.m._action_cleanup()
+        w = CNC.writes
+        self.assertIn(('motor_lock', '8'), w)
+        self.assertIn(('z_current', 1), w)
 
     def test_a_cancel_at_the_button_wait_stops_the_feeder_before_the_park(self):
         # A two-hour print, ring full, the operator opens the lid while the

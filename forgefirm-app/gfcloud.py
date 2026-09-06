@@ -57,9 +57,13 @@ OFFLINE_MARKER = '/run/gfcloud-offline'
 OFFLINE_SOCKET = '/run/gfcloud-offline.sock'
 EMULATE_MARKER = '/run/gfcloud-emulate'
 NOHUNT_MARKER = '/run/gfcloud-nohunt'
+# The commissioning wizard's one-start request: capture the next print's
+# pulse header for the daemon and cancel that print before it arms.
+CAPTURE_MARKER = '/run/gfcloud-capture'
+CAPTURE_PATH = '/run/forgefirm/cloud-header.json'
 
 
-def take_markers(paths=(OFFLINE_MARKER, EMULATE_MARKER, NOHUNT_MARKER)) -> dict:
+def take_markers(paths=(OFFLINE_MARKER, EMULATE_MARKER, NOHUNT_MARKER, CAPTURE_MARKER)) -> dict:
     """Which one-start markers this start found, each taken down as it is
     read. Called before anything slow is imported, so the marker is gone
     within the interpreter's own start-up. A marker that cannot be
@@ -127,6 +131,7 @@ def main() -> int:
     offline = args.offline or bool(MARKERS[OFFLINE_MARKER])
     emulate = args.emulate or bool(MARKERS[EMULATE_MARKER])
     nohunt = args.no_hunt or bool(MARKERS[NOHUNT_MARKER])
+    capture = bool(MARKERS[CAPTURE_MARKER])
 
     # Logging first: syslog under the gfcloud program name, level from
     # /data/forgefirm.conf (log_gfcloud_disk / _remote).
@@ -141,6 +146,7 @@ def main() -> int:
         return 1
 
     ffmachine.apply_identity_overrides()
+    ffmachine.apply_user_agent()
 
     # Machine() reads the OCOTP identity and head info; it fails cleanly if
     # grblHAL still holds /dev/glowforge (controller_mode must be cloud).
@@ -157,6 +163,10 @@ def main() -> int:
     elif nohunt:
         logger.info('no-hunt ignored: the %s has no connect-time hunt to skip',
                     'offline service' if offline else 'emulator keeps its hunt')
+    if capture and not offline and not emulate:
+        ffmachine.request_header_capture(CAPTURE_PATH)
+    elif capture:
+        logger.info('header capture ignored: no real service to send a header')
 
     if offline:
         from gfutilities.service.offline import OfflineService

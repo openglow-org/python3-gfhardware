@@ -4,10 +4,15 @@ gfhome - one-shot Glowforge web-service homing for ForgeFIRM
 
 Connects the machine to the Glowforge web service just long enough for
 the service to run its camera-based homing sequence (settings report ->
-hunt (Z/lens) -> lid image -> move to the home corner -> lid image),
-then parks the lens at the hall-sensor reference, disconnects, and
-exits. All three axes end at the factory home position: X/Y at the
-back-left home corner, Z at the top-of-travel hall trigger.
+hunt -> lid image -> move to the home corner -> lid image). The hunt is
+answered as done without moving the lens or playing its file: the
+session borrows the service for its camera homing only. After the
+service goes quiet the lens takes its one reference, on the hall
+sensor's rising edge, moves the half-steps the controller asked for
+(GFHOME_PARK_HALF_STEPS, from the edge to the park height, never onto a
+stop), and the run exits. X/Y end at the back-left home corner; the
+controller sets Z from the edge's focal height (the focus card's number)
+and the park.
 
 The grblHAL-glowforge controller invokes this for $H when
 homing_mode = gfcloud is set in /data/forgefirm.conf, releasing
@@ -256,14 +261,17 @@ def home(machine, args) -> int:
         except NameError:
             pass
         if result == 0:
-            # Deterministic Z: the hunt file leaves the lens wherever its
-            # pattern ends; re-reference against the hall sensor so the
-            # controller can trust top-of-travel.
+            # The run's lens moves: reference the lens on the hall
+            # sensor's rising edge (the controller knows its focal height
+            # from the focus card), then park it the half-steps the
+            # controller handed over. The hunt inside the session moved
+            # nothing.
             try:
                 from gfhardware.z_axis import ZAxis
                 ZAxis.home()
+                ffmachine.park_lens(int(os.environ.get('GFHOME_PARK_HALF_STEPS', '0')))
             except Exception:
-                logger.exception('final Z reference failed')
+                logger.exception('final Z reference or park failed')
                 result = 2
         ws.shutdown()
         try:
@@ -300,6 +308,8 @@ def main() -> int:
         return 1
 
     ffmachine.apply_identity_overrides()
+    ffmachine.apply_user_agent()
+    ffmachine.acknowledge_hunts()
 
     # Machine() reads the OCOTP identity and head info; it fails cleanly
     # when the controller still owns /dev/glowforge.

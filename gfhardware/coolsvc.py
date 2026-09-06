@@ -108,7 +108,7 @@ class CoolingService(Thread):
         self._mode = 'idle'
         self._profile = {}
         self._limits = {}
-        port = os.getenv('FORGECTRL_PORT', '8080')
+        port = os.getenv('FORGECTRL_PORT', '80')
         self._url = 'http://127.0.0.1:%s/cool/state' % port
         Thread.__init__(self, daemon=True)
 

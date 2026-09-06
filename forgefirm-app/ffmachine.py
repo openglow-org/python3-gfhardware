@@ -29,6 +29,10 @@ MACHINE_CONF = os.environ.get('GFHOME_CONF', '/data/forgefirm.conf')
 # when enabled: never inside the log tree, so an export stays small.
 CAPTURE_ROOT = '/data/forgefirm/captures'
 
+# The image version stamp, written by the image build: a release version
+# "v<x.y.z>", or the dev image's build timestamp plus a dev tag.
+VERSION_FILE = '/etc/forgefirm-version'
+
 
 def read_machine_conf(machine_conf: str = MACHINE_CONF) -> dict:
     """The shared machine config as a dict ("key = value" lines, '#'
@@ -117,6 +121,35 @@ def setup_captures(app: str) -> None:
         except OSError:
             logger.warning('cannot create the capture directory %s', d)
 
+
+def forgefirm_version(version_file: str = VERSION_FILE) -> str:
+    """The ForgeFIRM version from the image stamp, as a product version:
+    a leading "v" before a digit is dropped ("v0.0.1" -> "0.0.1"), the
+    dev image's "<timestamp> (dev)" is kept as it is. "unknown" when the
+    stamp is unreadable or empty."""
+    try:
+        with open(version_file) as f:
+            stamp = f.readline()
+    except OSError:
+        stamp = ''
+    # A header value: printable ASCII only.
+    stamp = ''.join(c for c in stamp if ' ' <= c <= '~').strip()
+    if not stamp:
+        return 'unknown'
+    if stamp[0] in 'vV' and len(stamp) > 1 and stamp[1].isdigit():
+        stamp = stamp[1:]
+    return stamp
+
+
+def apply_user_agent(version_file: str = VERSION_FILE) -> None:
+    """After the app config is parsed: the User-Agent the Glowforge
+    service sees (SERVICE.USER_AGENT) is ForgeFIRM/<version>. A
+    user_agent set in the app config wins."""
+    if not get_cfg('SERVICE.USER_AGENT'):
+        set_cfg('SERVICE.USER_AGENT', 'ForgeFIRM/%s' % forgefirm_version(version_file))
+    logger.info('user agent: %s', get_cfg('SERVICE.USER_AGENT'))
+
+
 def hostname_for(serial) -> str:
     """The factory serial -> hostname derivation. One implementation,
     in gfhardware.id; imported lazily because importing gfhardware pulls
@@ -200,6 +233,44 @@ def inhibit_connect_hunt() -> None:
                 'its head position, no connect-time hunt')
 
 
+def acknowledge_hunts() -> None:
+    """A GRBL homing session's hunts are answered as done without moving
+    the lens or playing the hunt file: the session borrows the service for
+    its camera homing only, and the lens reference is the runner's own,
+    after the session."""
+    set_cfg('HOMING.HUNT_ACK_ONLY', True)
+    logger.info('HUNT-ACK: hunts are acknowledged without motion; the lens is referenced '
+                'after the session')
+
+
+def park_lens(half_steps: int) -> None:
+    """After the runner's reference the lens sits on the hall sensor's
+    rising edge. Move it `half_steps` (up positive) to the park height the
+    controller asked for, at the run current in half-step mode, and rest
+    the motor at the hold current. The count comes from the controller
+    (GFHOME_PARK_HALF_STEPS), clamped there to the window every head
+    reaches without touching a stop; the lens never meets a stop here."""
+    from gfhardware.z_axis import ZAxis
+    from gfhardware._common import ZCur, Microstep, Dir
+    if not half_steps:
+        logger.info('lens park: none, the park height is the edge')
+        return
+    ZAxis.configure(enabled=True, current=ZCur.HIGH, mode=Microstep.HALF)
+    direction = Dir.Pos if half_steps > 0 else Dir.Neg
+    for _ in range(abs(half_steps)):
+        ZAxis.step(direction)
+    ZAxis.configure(current=ZCur.LOW, mode=Microstep.HALF)
+    logger.info('lens parked %+d half-steps from the hall edge', half_steps)
+
+
+def request_header_capture(path: str) -> None:
+    """The commissioning wizard's request: the next print's pulse header
+    goes to `path` as JSON and that print is canceled before it arms. A
+    one-shot: the machine clears the request as it writes the file."""
+    set_cfg('CAPTURE.HEADER_PATH', path)
+    logger.info('HEADER CAPTURE: the next print reports its header to %s and does not run', path)
+
+
 def build_machine():
     """Build the hardware Machine with captures routed through forgectrl.
 
@@ -229,7 +300,7 @@ def build_machine():
         @staticmethod
         def _snapshot(cam: str, lamp: int = None) -> bytes:
             url = '%s/cam/snapshot?cam=%s&res=full' % (
-                get_cfg('FORGECTRL.URL') or 'http://127.0.0.1:8080', cam)
+                get_cfg('FORGECTRL.URL') or 'http://127.0.0.1', cam)
             if lamp is not None:
                 url += '&lamp=%d' % lamp
             rsp = requests.get(url, timeout=45)
