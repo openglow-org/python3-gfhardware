@@ -135,7 +135,10 @@ LIFECYCLE_KEYS = ('CFrh', 'CCwp', 'CCrp', 'CCup')
 
 # Header keys this client acts on outside the settings table: the serial the
 # job is locked to and the pulse-data format, both checked before a byte
-# reaches the ring.
+# reaches the ring. The microstep mode (XSmm, YSmm) is applied from the
+# table and checked by the same header check: anything but 8, the only
+# mode the service has ever sent and the only one a cloud job runs at
+# here, refuses the job.
 HEADER_CHECKED_KEYS = ('MCsn', 'PDfm')
 
 # Header keys the service fills in per job that this machine does not act
