@@ -8,6 +8,18 @@ of the `gfhardware` Python package; the ForgeFIRM image recipes install them
 directly from this directory. Cloud mode is documented on the documentation
 site: https://docs.forgefirm.org/technical/forgefirm/cloud-mode/
 
+## Test
+
+```sh
+python3 -m pytest tests/
+```
+
+## Contributing
+
+[AGENTS.md](AGENTS.md) carries the rules for this repository and for the
+project: safety ordering, proof before done, the push order, and the writing
+rules. They apply to human contributors too.
+
 ## License
 
 `gfhardware` and the ForgeFIRM applications are MIT licensed (see `LICENSE`),
