@@ -37,8 +37,8 @@ gantry; bench-characterized thresholds) before quiet counts as homed.
 Exit codes: 0 = homed, 1 = configuration/connection failure,
 2 = homing did not complete.
 
-(C) Copyright 2026
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 SPDX-License-Identifier: MIT
 """
 import argparse

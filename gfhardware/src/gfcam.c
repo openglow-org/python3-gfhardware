@@ -2,7 +2,8 @@
  * python-gfhardware _cam module
  * Python extension to grab a single raw frame from an imx-media V4L2 capture
  * node, debayer it, and return it as a JPEG.
- * Copyright 2020-2026, Scott Wiederhold <s.e.wiederhold@gmail.com>
+ * Copyright 2020-2026 514 LLC d/b/a OpenGlow
+ * Written by Scott Wiederhold
  * Released under the MIT license.
  * SPDX-License-Identifier: MIT
  *

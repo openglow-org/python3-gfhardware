@@ -6,8 +6,8 @@ image's "<timestamp> (dev)" stamp is kept as it is, and an unreadable or
 empty stamp gives ForgeFIRM/unknown. A user_agent set in the app config
 wins; an empty one does not.
 
-(C) Copyright 2026
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 SPDX-License-Identifier: MIT
 """
 import os

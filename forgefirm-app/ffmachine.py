@@ -7,8 +7,8 @@ overrides, and log the same way: through syslog under their own program
 name, at the level the shared machine config sets for that logger.
 Config-file parsing stays in each client.
 
-(C) Copyright 2026
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 SPDX-License-Identifier: MIT
 """
 import logging

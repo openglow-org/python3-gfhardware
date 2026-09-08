@@ -40,8 +40,8 @@ that take seconds on this board, by the client that starts: it applies
 to that one start, never to a respawn after it, and whoever wrote it can
 move on as soon as the supervisor reports the client up.
 
-(C) Copyright 2026
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 SPDX-License-Identifier: MIT
 """
 import argparse

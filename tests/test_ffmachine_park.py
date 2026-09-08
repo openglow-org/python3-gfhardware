@@ -7,8 +7,8 @@ run current in half-step mode, up or down, and rests the motor at the
 hold current; a count of zero moves nothing. The lens axis is a fake that
 records every call, installed only for the duration of each call.
 
-(C) Copyright 2026
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 SPDX-License-Identifier: MIT
 """
 import enum

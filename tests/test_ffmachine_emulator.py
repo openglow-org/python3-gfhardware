@@ -9,8 +9,8 @@ reconnect form, so the service keeps its head position.
 Host-side: the fuse identity is stubbed, gfutilities comes from the
 sibling checkout, nothing touches hardware.
 
-(C) Copyright 2026
-Scott Wiederhold, s.e.wiederhold@gmail.com
+Copyright 2026 514 LLC d/b/a OpenGlow
+Written by Scott Wiederhold
 SPDX-License-Identifier: MIT
 """
 import json
