@@ -98,7 +98,7 @@ HOLD_MAX_DEFAULT_S = 1800.0
 # The shared machine config: the same trivial "key = value" file the
 # GRBL controller and forgectrl read, so both controller modes honor
 # the same operator-facing tunables.
-MACHINE_CONF = os.environ.get('GFHOME_CONF', '/data/forgefirm.conf')
+MACHINE_CONF = os.environ.get('GFHOME_CONF', '/data/forgefirm/forgefirm.conf')
 
 # Feed watchdog. A live-fed run whose feeder stops making progress while the
 # ring has room for a chunk is a feed that has wedged. Left alone it ends the

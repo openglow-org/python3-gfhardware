@@ -15,7 +15,7 @@ controller sets Z from the edge's focal height (the focus card's number)
 and the park.
 
 The grblHAL-glowforge controller invokes this for $H when
-homing_mode = gfcloud is set in /data/forgefirm.conf, releasing
+homing_mode = gfcloud is set in /data/forgefirm/forgefirm.conf, releasing
 /dev/glowforge for the duration of the run. It can also be run by hand
 (with the controller stopped or its homing session active). The same
 shared config supplies optional identity overrides (gf_serial /
@@ -61,7 +61,7 @@ from gfutilities.service.websocket import get_session, ws_connect
 
 import ffmachine
 
-CONF = '/data/etc/gfhome.conf'
+CONF = '/data/forgefirm/gfhome.conf'
 CONF_SAMPLE = '/etc/gfhome.conf.sample'
 
 logger = logging.getLogger('openglow')
@@ -302,7 +302,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(2))
 
     # Logging first: syslog under the gfhome program name, level from
-    # /data/forgefirm.conf (log_gfhome_disk / _remote).
+    # /data/forgefirm/forgefirm.conf (log_gfhome_disk / _remote).
     ffmachine.setup_logging('gfhome')
     if not load_config(args.config):
         return 1

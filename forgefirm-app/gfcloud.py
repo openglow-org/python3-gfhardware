@@ -5,7 +5,7 @@ gfcloud - full Glowforge web-service controller for ForgeFIRM.
 Runs the machine under the Glowforge web service (the factory cloud
 experience): the phone/web app drives homing, framing, and printing.
 Started by the gfcloud init service when controller_mode = cloud in
-/data/forgefirm.conf, which keeps grblHAL down so this daemon owns
+/data/forgefirm/forgefirm.conf, which keeps grblHAL down so this daemon owns
 /dev/glowforge exclusively.
 
 Reconnects (fresh single-use ws_token) and 401 re-auth are handled in
@@ -89,7 +89,7 @@ from gfutilities import GFUIService                    # noqa: E402
 
 import ffmachine                                       # noqa: E402
 
-CONF = '/data/etc/gfhome.conf'
+CONF = '/data/forgefirm/gfhome.conf'
 CONF_SAMPLE = '/etc/gfhome.conf.sample'
 EMULATOR_DIR = '/usr/share/gfutilities/emulator'
 EMULATOR_WORK = '/tmp/gfcloud-emulate'
@@ -134,7 +134,7 @@ def main() -> int:
     capture = bool(MARKERS[CAPTURE_MARKER])
 
     # Logging first: syslog under the gfcloud program name, level from
-    # /data/forgefirm.conf (log_gfcloud_disk / _remote).
+    # /data/forgefirm/forgefirm.conf (log_gfcloud_disk / _remote).
     ffmachine.setup_logging('gfcloud')
     for marker, found in MARKERS.items():
         if found is True:

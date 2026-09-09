@@ -23,7 +23,7 @@ logger = logging.getLogger('openglow')
 # The shared machine config (identity overrides, homing/controller mode,
 # log levels), managed from the forgectrl UI. Override the path with
 # GFHOME_CONF.
-MACHINE_CONF = os.environ.get('GFHOME_CONF', '/data/forgefirm.conf')
+MACHINE_CONF = os.environ.get('GFHOME_CONF', '/data/forgefirm/forgefirm.conf')
 
 # Where the optional debug captures (raw pulse files, sent images) go
 # when enabled: never inside the log tree, so an export stays small.

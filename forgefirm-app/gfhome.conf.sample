@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # gfhome - Glowforge web-service homing configuration.
-# Copied to /data/etc/gfhome.conf on first run; edit the copy.
+# Copied to /data/forgefirm/gfhome.conf on first run; edit the copy.
 # Machine identity (serial/password) is read from the OCOTP fuses;
-# gf_serial / gf_password in /data/forgefirm.conf (the forgectrl UI,
+# gf_serial / gf_password in /data/forgefirm/forgefirm.conf (the forgectrl UI,
 # GF Cloud tab) override it. The service hostname always derives from
 # whichever serial is in effect.
 
@@ -26,7 +26,7 @@ status_file: /data/forgefirm/gf-latest.json
 # gfhome and gfcloud log through syslog under their own program names;
 # rsyslog files them under /data/log/forgefirm/<name>/ at the levels set
 # in the control panel (log_gfhome_* / log_gfcloud_* in
-# /data/forgefirm.conf, applied at reboot). Nothing to set here.
+# /data/forgefirm/forgefirm.conf, applied at reboot). Nothing to set here.
 # Optional debug captures (raw pulse files, the images sent to the
 # service) land in capture_dir (default /data/forgefirm/captures/<name>).
 save_puls: False
