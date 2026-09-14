@@ -35,12 +35,18 @@ sys.modules['gfhardware'] = _pkg
 class FakeCNC:
     def __init__(self):
         self.streaming_writes = []
+        self.fail_with = None           # the write raises this
+        self.readback = None            # what the device reads, when not the write
 
     def set_streaming(self, val):
+        if self.fail_with is not None:
+            raise self.fail_with
         self.streaming_writes.append(int(val))
 
     @property
     def streaming(self):
+        if self.readback is not None:
+            return self.readback
         return bool(self.streaming_writes and self.streaming_writes[-1])
 
 
@@ -54,6 +60,11 @@ import gfhardware.feeder as feeder_mod                           # noqa: E402
 from gfhardware.feeder import PulseFeeder                        # noqa: E402
 
 CNC = _cnc_mod.cnc
+
+
+# A stream carries a power byte before its first FIRE byte, as every one the
+# service sends does; the feeder refuses one that does not.
+POWERED = b'\x80'
 
 
 def _puls(payload: bytes) -> bytes:
@@ -111,7 +122,7 @@ def _wait(pred, timeout=5.0):
 
 class FeederTest(unittest.TestCase):
     def setUp(self):
-        CNC.streaming_writes = []
+        CNC.__init__()
 
     def _feeder(self, payload, capacity, chunk=1024):
         source = PulseSource(_puls(payload))
@@ -120,7 +131,7 @@ class FeederTest(unittest.TestCase):
 
     # -- the ordinary job ------------------------------------------------
     def test_job_that_fits_is_enqueued_whole_and_is_not_a_live_feed(self):
-        payload = bytes(range(256)) * 20                 # 5120 bytes
+        payload = POWERED + bytes(range(256)) * 20       # 5121 bytes
         feeder, ring = self._feeder(payload, capacity=1 << 20)
         feeder.start()
         self.assertTrue(feeder.wait_primed(timeout=5))
@@ -135,7 +146,7 @@ class FeederTest(unittest.TestCase):
 
     # -- the job that outruns the ring -----------------------------------
     def test_job_longer_than_the_ring_is_fed_as_it_plays(self):
-        payload = bytes(range(256)) * 400                # 102400 bytes
+        payload = POWERED + bytes(range(256)) * 400      # 102401 bytes
         capacity = 8192                                  # ring holds 8 KB
         feeder, ring = self._feeder(payload, capacity, chunk=1024)
         feeder.start()
@@ -177,7 +188,7 @@ class FeederTest(unittest.TestCase):
         # What a progress report divides by, and the reason it can be
         # reported from the first frame: the length is known while most of
         # the job is still waiting to be fed.
-        payload = bytes(range(256)) * 400                # 102400 bytes
+        payload = POWERED + bytes(range(256)) * 400      # 102401 bytes
         feeder, ring = self._feeder(payload, capacity=8192, chunk=1024)
         feeder.start()
         self.assertTrue(feeder.wait_primed(timeout=5))
@@ -186,7 +197,7 @@ class FeederTest(unittest.TestCase):
         feeder.stop()
 
     def test_a_finished_feed_reports_what_it_actually_delivered(self):
-        payload = bytes(range(256)) * 20
+        payload = POWERED + bytes(range(256)) * 20
         feeder, ring = self._feeder(payload, capacity=1 << 20)
         feeder.start()
         self.assertTrue(_wait(lambda: feeder.finished))
@@ -213,7 +224,7 @@ class FeederTest(unittest.TestCase):
 
     # -- accounting ------------------------------------------------------
     def test_step_totals_match_decoding_the_whole_job(self):
-        payload = bytes(range(256)) * 40
+        payload = POWERED + bytes(range(256)) * 40
         feeder, ring = self._feeder(payload, capacity=1 << 20)
         feeder.start()
         self.assertTrue(_wait(lambda: feeder.finished))
@@ -246,6 +257,48 @@ class FeederTest(unittest.TestCase):
         feeder.stop()
         self.assertEqual(CNC.streaming_writes, [1, 0])
         self.assertFalse(feeder.streaming)
+
+    # -- the live-feed declaration must land ------------------------------
+    def test_a_streaming_write_that_fails_raises(self):
+        # A declaration that did not land would let the device read the
+        # first drained window as the job's end: the failure is the
+        # caller's to act on, never a logged line.
+        payload = bytes(200000)
+        feeder, ring = self._feeder(payload, capacity=4096)
+        feeder.start()
+        self.assertTrue(feeder.wait_primed(timeout=5))
+        CNC.fail_with = OSError(errno.EIO, 'I/O error')
+        with self.assertRaises(OSError):
+            feeder.declare_live_feed()
+        self.assertFalse(feeder.streaming)
+        CNC.fail_with = None
+        feeder.stop()
+
+    def test_a_streaming_write_that_does_not_land_raises(self):
+        payload = bytes(200000)
+        feeder, ring = self._feeder(payload, capacity=4096)
+        feeder.start()
+        self.assertTrue(feeder.wait_primed(timeout=5))
+        CNC.readback = False                             # the device still reads 0
+        with self.assertRaises(OSError):
+            feeder.declare_live_feed()
+        self.assertEqual(CNC.streaming_writes, [1])
+        self.assertFalse(feeder.streaming)
+        CNC.readback = None
+        feeder.stop()
+
+    def test_a_drained_window_with_bytes_left_is_not_a_finished_feed(self):
+        # The signature of a live feed the device did not take as one: the
+        # ring drains and is topped up, and the job is nowhere near done.
+        payload = bytes(200000)
+        feeder, ring = self._feeder(payload, capacity=4096, chunk=1024)
+        feeder.start()
+        self.assertTrue(feeder.wait_primed(timeout=5))
+        ring.drain(4096)
+        self.assertTrue(_wait(lambda: feeder.written > 4096))
+        self.assertFalse(feeder.finished)
+        feeder.stop()
+        self.assertFalse(feeder.finished)
 
 
 if __name__ == '__main__':

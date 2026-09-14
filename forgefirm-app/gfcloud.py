@@ -4,13 +4,16 @@ gfcloud - full Glowforge web-service controller for ForgeFIRM.
 
 Runs the machine under the Glowforge web service (the factory cloud
 experience): the phone/web app drives homing, framing, and printing.
-Started by the gfcloud init service when controller_mode = cloud in
-/data/forgefirm/forgefirm.conf, which keeps grblHAL down so this daemon owns
-/dev/glowforge exclusively.
+Started by forgectrl's supervisor when controller_mode = cloud in
+/data/forgefirm/forgefirm.conf (the init script defers to it): the
+supervisor holds /dev/glowforge and hands this daemon its fd, and it
+keeps grblHAL down while this daemon runs.
 
 Reconnects (fresh single-use ws_token) and 401 re-auth are handled in
 gfutilities. On SIGTERM the service loop stops and the machine is shut
-down safe (laser latched, steppers disabled, deadman released).
+down safe (laser latched, steppers disabled, deadman released). If the
+WebSocket thread itself dies, the service loop ends the same way and
+this process exits; the supervisor starts it again.
 
 Offline: with --offline, or while the marker file OFFLINE_MARKER exists
 at start, the machine runs under gfutilities' OfflineService instead: no
@@ -185,8 +188,10 @@ def main() -> int:
     # Run for the life of the daemon. connect() can fail if the network or
     # service is briefly unavailable (e.g. at boot); retry until stopped.
     # Once connected, run() stays up across WS drops (gfutilities reconnects
-    # with a fresh token) and returns only when a stop is requested, having
-    # shut the machine down safe.
+    # with a fresh token) and returns when a stop is requested or when the
+    # WebSocket thread has died, having shut the machine down safe either
+    # way; the break below then ends the process, and the supervisor
+    # starts a new one.
     while not service.stop:
         if service.connect():
             service.run()

@@ -66,6 +66,11 @@ CONF_SAMPLE = '/etc/gfhome.conf.sample'
 
 logger = logging.getLogger('openglow')
 
+# SIGTERM (the controller's $H budget ran out, a supervisor stopping the
+# controller) asks the session to end; the loop sees the flag within its
+# poll and leaves through the same shutdown as every other exit.
+_stop = threading.Event()
+
 
 def load_config(path: str) -> bool:
     if path == CONF and not Path(CONF).is_file() and Path(CONF_SAMPLE).is_file():
@@ -194,6 +199,9 @@ def home(machine, args) -> int:
 
         while True:
             now = time.monotonic()
+            if _stop.is_set():
+                logger.warning('stopped (SIGTERM) - not homed')
+                return 2
             if now - t0 > args.timeout:
                 logger.error('homing timed out after %ds (completed: %s)',
                              args.timeout, sorted(done) or 'nothing')
@@ -260,24 +268,38 @@ def home(machine, args) -> int:
             accel.stop = True
         except NameError:
             pass
-        if result == 0:
-            # The run's lens moves: reference the lens on the hall
-            # sensor's rising edge (the controller knows its focal height
-            # from the focus card), then park it the half-steps the
-            # controller handed over. The hunt inside the session moved
-            # nothing.
-            try:
-                from gfhardware.z_axis import ZAxis
-                ZAxis.home()
-                ffmachine.park_lens(int(os.environ.get('GFHOME_PARK_HALF_STEPS', '0')))
-            except Exception:
-                logger.exception('final Z reference or park failed')
-                result = 2
-        ws.shutdown()
+        result = finish(machine, ws, result)
+    return result
+
+
+def finish(machine, ws, result: int) -> int:
+    """The end of every session, whatever ended it.
+
+    A homed run (result 0) takes its lens moves first: reference the lens
+    on the hall sensor's rising edge (the controller knows its focal
+    height from the focus card), then park it the half-steps the
+    controller handed over; the hunt inside the session moved nothing.
+    Then the service socket is shut and the machine stopped - always:
+    nothing the lens moves raise, an exit included, may skip the stop
+    that locks the laser and releases the device. Returns the result,
+    2 when the lens moves failed.
+    """
+    if result == 0:
         try:
-            machine.stop()
-        except Exception:
-            logger.exception('machine shutdown failed')
+            from gfhardware.z_axis import ZAxis
+            ZAxis.home()
+            ffmachine.park_lens(int(os.environ.get('GFHOME_PARK_HALF_STEPS', '0')))
+        except BaseException:
+            logger.exception('final Z reference or park failed')
+            result = 2
+    try:
+        ws.shutdown()
+    except BaseException:
+        logger.exception('service shutdown failed')
+    try:
+        machine.stop()
+    except BaseException:
+        logger.exception('machine shutdown failed')
     return result
 
 
@@ -299,7 +321,7 @@ def main() -> int:
                     help='silence after the last action that means done (default 10)')
     args = ap.parse_args()
 
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(2))
+    signal.signal(signal.SIGTERM, lambda *_: _stop.set())
 
     # Logging first: syslog under the gfhome program name, level from
     # /data/forgefirm/forgefirm.conf (log_gfhome_disk / _remote).

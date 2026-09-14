@@ -7,6 +7,7 @@ SPDX-License-Identifier:    MIT
 """
 import errno
 import logging
+import re
 import threading
 from time import monotonic
 
@@ -33,6 +34,18 @@ RETRY_S = 0.5
 PENDING_MAX = 48 * 1024 * 1024
 
 _BACKOFF = (errno.ENOMEM, errno.EBUSY, errno.EAGAIN)
+
+# The pulse byte: bit 7 set is a laser power level; bit 7 clear is a step
+# byte, and its bit 4 is FIRE. The kernel resets the duty to about full on
+# every run, so a stream must carry a power byte before its first FIRE or
+# the first pulses fire at full power. The feeder refuses such a stream
+# before the FIRE byte reaches the ring.
+_POWER_BYTE = re.compile(rb'[\x80-\xff]')
+_FIRE_BYTE = re.compile(rb'[\x10-\x1f\x30-\x3f\x50-\x5f\x70-\x7f]')
+
+
+class PulseBodyError(Exception):
+    """The job's bytes are not fit for the ring."""
 
 
 class PulseFeeder:
@@ -68,6 +81,8 @@ class PulseFeeder:
         self._pending = []
         self._pending_bytes = 0
         self._books = threading.Lock()
+        self._powered = False           # a power byte has been seen
+        self._scanned = 0               # payload bytes checked so far
 
     # -- state -----------------------------------------------------------
     @property
@@ -150,15 +165,52 @@ class PulseFeeder:
         if self._streaming:
             # An abandoned job must not leave the next one being read as a
             # live feed, where its ordinary end-of-data would be an underrun.
-            self._set_streaming(False)
+            try:
+                self._set_streaming(False)
+            except OSError as e:
+                logger.error('%s', e)
 
     # -- the feed --------------------------------------------------------
     def _set_streaming(self, on: bool) -> None:
+        """Put the device in or out of live-feed mode, and prove it.
+
+        The write is read back: a declaration that did not land would let
+        the device read the first drained window as the job's end. Raises
+        OSError when the write fails or the readback disagrees; the caller
+        decides what that means for the job (before a run: fatal).
+        """
         try:
             cnc.set_streaming(on)
-            self._streaming = on
         except OSError as e:
-            logger.error('could not set streaming=%d: %s', int(on), e)
+            raise OSError('could not set streaming=%d: %s' % (int(on), e)) from e
+        if bool(cnc.streaming) != bool(on):
+            raise OSError('streaming=%d did not land: the device reads %d'
+                          % (int(on), int(bool(cnc.streaming))))
+        self._streaming = on
+
+    def _fit_for_the_ring(self, chunk: bytes) -> bool:
+        """Refuse a stream whose first FIRE byte precedes any power byte.
+
+        Checked on the way to the ring, so the offending byte never reaches
+        it: a refusal before the run cancels the job; one past the primed
+        window stops the feed, and the run ends on a starved ring rather
+        than a full-power pulse.
+        """
+        if self._powered:
+            return True
+        fire = _FIRE_BYTE.search(chunk)
+        power = _POWER_BYTE.search(chunk)
+        if fire is not None and (power is None or fire.start() < power.start()):
+            offset = self._scanned + fire.start()
+            self._error = PulseBodyError(
+                'laser fire at payload byte %d before any power byte: the first '
+                'pulses would fire at full power' % offset)
+            logger.error('refusing the job: %s', self._error)
+            return False
+        if power is not None:
+            self._powered = True
+        self._scanned += len(chunk)
+        return True
 
     def _account(self, limit: int = 1) -> None:
         """Decode up to ``limit`` already-enqueued chunks."""
@@ -224,14 +276,23 @@ class PulseFeeder:
                 chunk = self._source.read(self._chunk)
                 if not chunk:
                     break
+                if not self._fit_for_the_ring(chunk):
+                    return
                 if not self._write(chunk):
                     return
             if self._stop.is_set():
                 return
             if self._streaming:
                 # Every byte is enqueued: the next end-of-data is the end of
-                # the job, not a starved ring.
-                self._set_streaming(False)
+                # the job, not a starved ring. A device that will not leave
+                # live-feed mode would read the job's own end as one, so
+                # the failure is the feed's.
+                try:
+                    self._set_streaming(False)
+                except OSError as e:
+                    self._error = e
+                    logger.error('%s', e)
+                    return
             logger.info('feeder finished: %d bytes enqueued', self._written)
             declared = getattr(self._source, 'program_size', None)
             if declared is not None and declared != self._written:

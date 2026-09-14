@@ -941,13 +941,15 @@ class JobLifecycleTests(unittest.TestCase):
         #.
         self.assertEqual(self.m._dwell('warm_up'), machine_mod.WARM_UP_DEFAULT_S)
         self.assertEqual(self.m._dwell('cool_down'), machine_mod.COOL_DOWN_DEFAULT_S)
-        self.assertEqual(self.slept, [machine_mod.WARM_UP_DEFAULT_S,
-                                      machine_mod.COOL_DOWN_DEFAULT_S])
+        # Taken in slices, so the lid and a cancel are seen between them.
+        self.assertAlmostEqual(sum(self.slept),
+                               machine_mod.WARM_UP_DEFAULT_S + machine_mod.COOL_DOWN_DEFAULT_S)
+        self.assertTrue(all(s <= machine_mod.DWELL_SLICE_S + 1e-9 for s in self.slept))
 
     def test_a_configured_period_wins(self):
         set_cfg('MOTION.WARM_UP_DELAY', '5')
         self.assertEqual(self.m._dwell('warm_up'), 5.0)
-        self.assertEqual(self.slept, [5.0])
+        self.assertAlmostEqual(sum(self.slept), 5.0)
 
     def test_zero_still_skips_the_period(self):
         # A machine whose config carries the zeros the old sample shipped
@@ -1243,6 +1245,8 @@ class FeederExitTests(unittest.TestCase):
             self.stats = {}
             self.job_total = 5000
             self.live = False
+            self.completes = False      # the feed finishes once declared live
+            self.declare_error = None   # the declaration raises this
 
         def start(self):
             pass
@@ -1251,7 +1255,11 @@ class FeederExitTests(unittest.TestCase):
             return True
 
         def declare_live_feed(self):
+            if self.declare_error is not None:
+                raise self.declare_error
             self.live = True
+            if self.completes:
+                self.finished = True
 
         def settle(self, timeout=60.0):
             return True
@@ -1269,6 +1277,8 @@ class FeederExitTests(unittest.TestCase):
         SW.handler = self.m._switch_event
         self.feeder = None
         self.long_job = True
+        self.feed_completes = False
+        self.declare_error = None
         self._fetch = machine_mod.fetch_motion
         self._feeder_cls = machine_mod.PulseFeeder
         self._sleep = machine_mod.sleep
@@ -1289,6 +1299,8 @@ class FeederExitTests(unittest.TestCase):
 
     def _make_feeder(self, source, dev):
         self.feeder = self.JobFeeder(finished=not self.long_job)
+        self.feeder.completes = self.feed_completes
+        self.feeder.declare_error = self.declare_error
         return self.feeder
 
     @staticmethod
@@ -1358,6 +1370,90 @@ class FeederExitTests(unittest.TestCase):
         self.assertLess(w.index(('feeder_stop', 1)), w.index(('run', 1)))
         self.assertEqual(self.parks, [(-500, -300)])
 
+    # -- the latch: locked until the verdict has passed, unlocked right
+    #    before the run ---------------------------------------------------
+    def test_the_latch_stays_locked_through_the_waits_and_unlocks_before_the_run(self):
+        self.feed_completes = True
+        CNC.xy_steps = (0, 0)
+        CNC.run_reads = 3
+        seen = []
+        SW._later(0.05, lambda: (seen.append(CNC.latch),
+                                 SW._edge(InputSwitch.SW_BUTTON, True),
+                                 SW._edge(InputSwitch.SW_BUTTON, False)))
+        self.m._motion_locked(self._print(), None)
+        self.assertFalse(self.m._running_action_cancelled)
+        self.assertEqual(seen, [1], 'the latch was open at the press')
+        w = CNC.writes
+        self.assertIn(('run', 1), w)
+        self.assertEqual(w.index(('laser_latch', 0)) + 1, w.index(('run', 1)),
+                         'the unlock is the write immediately before the run: %r' % w)
+        self.assertEqual(w.count(('laser_latch', 0)), 1)
+        self.assertGreater(w.index(('laser_latch', 1), w.index(('run', 1))),
+                           w.index(('run', 1)), 'the job end relocks')
+
+    def test_a_fire_blocked_verdict_before_the_run_leaves_the_latch_locked_and_cancels(self):
+        # The engine refuses fire for the whole bounded wait (a fail tier
+        # left standing, a hold that never clears): the latch was never
+        # unlocked, so there is nothing to relock, and the job never runs.
+        self.m._hold_max_s = lambda: 0.3
+        COOL._fire_ok = False
+        COOL.name = 'CRASH'
+        CNC.xy_steps = (0, 0)
+        SW.press(delay=0.05)
+        self.m._motion_locked(self._print(), None)
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertNotIn(('laser_latch', 0), CNC.writes)
+        self.assertNotIn(('run', 1), CNC.writes)
+        self.assertFalse(COOL.armed)
+        self._assert_feeder_stopped_before_the_park()
+
+    # -- the warm-up is supervised ----------------------------------------
+    def test_a_lid_opened_during_the_warm_up_cancels_at_once(self):
+        machine_mod.sleep = self._sleep                  # a real warm-up
+        set_cfg('MOTION.WARM_UP_DELAY', '3')
+        set_cfg('MOTION.COOL_DOWN_DELAY', '0')           # the cancel's tail is not the point
+        try:
+            CNC.xy_steps = (0, 0)
+            SW.press(delay=0.05)
+            SW.open_lid(delay=0.35)                      # inside the warm-up
+            t0 = time.monotonic()
+            self.m._motion_locked(self._print(), None)
+            took = time.monotonic() - t0
+        finally:
+            set_cfg('MOTION.WARM_UP_DELAY', None)
+            set_cfg('MOTION.COOL_DOWN_DELAY', None)
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertLess(took, 0.35 + 0.3, 'the warm-up sat out the lid: %.2f s' % took)
+        self.assertNotIn(('laser_latch', 0), CNC.writes)
+        self.assertNotIn(('run', 1), CNC.writes)
+        self.assertFalse(COOL.armed)
+
+    # -- a live feed that did not land, or did not finish -----------------
+    def test_a_live_feed_that_cannot_be_declared_cancels_before_the_run(self):
+        self.declare_error = OSError('streaming=1 did not land')
+        CNC.xy_steps = (0, 0)
+        SW.press(delay=0.05)
+        self.m._motion_locked(self._print(), None)
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertNotIn(('run', 1), CNC.writes)
+        self.assertNotIn(('laser_latch', 0), CNC.writes)
+        self.assertFalse(COOL.armed)
+        self._assert_feeder_stopped_before_the_park()
+
+    def test_a_live_fed_run_that_ends_with_bytes_unfed_is_canceled(self):
+        # The kernel went idle with the feeder still holding part of the
+        # job: whatever played, the print did not finish, and the service
+        # is never told it completed.
+        CNC.xy_steps = (0, 0)
+        CNC.run_reads = 3
+        SW.press(delay=0.05)
+        self.m._motion_locked(self._print(), None)
+        self.assertTrue(self.feeder.live)
+        self.assertFalse(self.feeder.finished)
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertIn(('run', 1), CNC.writes)
+        self._assert_feeder_stopped_before_the_park()
+
     def test_a_blocked_verdict_stops_the_feeder(self):
         COOL.stale = True
         CNC.xy_steps = (0, 0)
@@ -1405,7 +1501,9 @@ class FeederExitTests(unittest.TestCase):
 
     def test_a_long_print_that_runs_to_the_end_parks_after_its_feed(self):
         # The ordinary path through the same code: button pressed, the run
-        # plays out, the feed is declared live and stopped before the park.
+        # plays out, the feed is declared live, finishes, and is stopped
+        # before the park.
+        self.feed_completes = True
         CNC.xy_steps = (500, 300)
         CNC.run_reads = 3
         SW.press(delay=0.05)
@@ -1675,6 +1773,9 @@ class VerdictWaitTests(unittest.TestCase):
         self.m._verdict_wait()
         self.assertGreater(time.monotonic() - t0, 0.25)
         self.assertFalse(self.m._running_action_cancelled)
+        # The latch is nobody's business during the hold: locked from
+        # before the button, unlocked only once the run starts.
+        self.assertNotIn(('laser_latch', 0), CNC.writes)
         self.assertNotIn(('laser_latch', 1), CNC.writes)
 
     def test_a_clean_verdict_does_not_wait(self):

@@ -123,6 +123,9 @@ FEED_MAX_HOLDS = 3         # a feed that keeps stalling is sawing the material
 # factory does nothing with them, so the numbers come from the config with the
 # factory's measured behavior as the default.
 WARM_UP_DEFAULT_S = 3.0
+# The slice a dwell is taken in: the lid, the interlock and a cancel are
+# sampled between slices during the warm-up.
+DWELL_SLICE_S = 0.1
 COOL_DOWN_DEFAULT_S = 10.0
 
 # Header keys that speak to a job's lifecycle rather than to its motion: a
@@ -402,10 +405,13 @@ class Machine(BaseMachine):
         """Wait out a cooling hold before the run starts.
 
         The armed session is open, so the engine is working on whatever
-        holds it (the warm-up heater, the loop cooling). Bounded by
-        cloud_hold_max_s; the lid, the interlock loop, a service cancel,
-        and a verdict that goes missing end it the way they end the
-        button wait: latch relocked, disarmed, job canceled.
+        holds it (the warm-up heater, the loop cooling). The laser latch
+        is still locked here: it unlocks only once this wait has passed,
+        immediately before the run starts, so a verdict that never
+        clears leaves it locked. Bounded by cloud_hold_max_s; the lid,
+        the interlock loop, a service cancel, and a verdict that goes
+        missing end it the way they end the button wait: latch locked,
+        disarmed, job canceled.
 
         The engine's own armed flag is required before the verdict
         counts as clean. Until the engine has seen the armed report and
@@ -449,15 +455,17 @@ class Machine(BaseMachine):
             logger.info('cooling verdict clean after %s; starting the run', named)
 
     def _button_wait(self, msg: dict) -> None:
-        # The wait runs with the latch already unlocked, so it is
-        # bounded and supervised the same way GRBL mode's arm window is:
-        # the shared laser_button_timeout_s (default 300 s, clamped to
-        # 1-3600 - out-of-range values fall back, never wait-forever)
-        # bounds it, and an opened lid or interlock loop ends it (the
-        # hardware button latch would ignore the press anyway). Timeout,
-        # lid, interlock, and cloud cancel all relock the latch and disarm
-        # before returning. Wakes on switch edges, so a press or a lid
-        # open is seen within milliseconds.
+        # The wait runs with the armed session open and the latch still
+        # locked (the unlock comes right before the run, once the verdict
+        # has passed), and it is bounded and supervised the same way GRBL
+        # mode's arm window is: the shared laser_button_timeout_s
+        # (default 300 s, clamped to 1-3600 - out-of-range values fall
+        # back, never wait-forever) bounds it, and an opened lid or
+        # interlock loop ends it (the hardware button latch would ignore
+        # the press anyway). Timeout, lid, interlock, and cloud cancel all
+        # leave the latch locked and disarm before returning. Wakes on
+        # switch edges, so a press or a lid open is seen within
+        # milliseconds.
         timeout_s = _conf_float('laser_button_timeout_s', 300.0)
         if not 1.0 <= timeout_s <= 3600.0:
             timeout_s = 300.0
@@ -865,7 +873,11 @@ class Machine(BaseMachine):
                 logger.error('no cooling verdict; the print cannot arm')
                 self._running_action_cancelled = True
             else:
-                cnc.laser_latch(0)
+                # The latch stays locked through the button wait, the
+                # warm-up and the verdict wait: it unlocks once the
+                # verdict has passed, right before the run. A fire_ok
+                # false verdict at any point before the run therefore
+                # never finds the latch open.
                 cooling_svc.set_armed(True)
                 self._button_wait(msg)
             if not self._running_action_cancelled:
@@ -893,8 +905,17 @@ class Machine(BaseMachine):
                 send_wss_event(self._q_msg_tx, msg['id'], 'print:running')
             if not self._feeder.finished:
                 # End-of-data mid-run now means a starved ring, not a
-                # finished job.
-                self._feeder.declare_live_feed()
+                # finished job. A declaration that did not land is fatal:
+                # the ring would read its first drained window as the
+                # job's end and the service would be told it completed.
+                try:
+                    self._feeder.declare_live_feed()
+                except OSError as e:
+                    logger.error('cannot declare the live feed (%s); canceling '
+                                 'the job before it starts', e)
+                    self._running_action_cancelled = True
+                    cooling_svc.set_armed(False)
+        if not self._running_action_cancelled:
             progress = None
             if msg['action_type'] == 'print':
                 # Only a print is long enough to need a bar, and only a
@@ -903,9 +924,19 @@ class Machine(BaseMachine):
                 progress = _JobProgress(self._q_msg_tx, msg['id'],
                                         'print:progress',
                                         self._feeder.job_total)
-            self._run_loop(lid_gated=lid_gated,
-                           pausable=msg['action_type'] == 'print',
-                           progress=progress)
+            aborted = self._run_loop(lid_gated=lid_gated,
+                                     pausable=msg['action_type'] == 'print',
+                                     progress=progress,
+                                     unlock_latch=msg['action_type'] == 'print')
+            if not aborted and not self._running_action_cancelled and not self._feeder.finished:
+                # The kernel went idle with part of the job still in the
+                # feeder's hands: a live feed the device did not take as
+                # one, or a ring that drained ahead of the feed. Whatever
+                # played, the job did not finish, and the service must
+                # never be told it completed.
+                logger.error('run ended with %d of %s bytes fed; the job did not finish',
+                             self._feeder.written, self._feeder.job_total)
+                self._running_action_cancelled = True
             if self._feeder.finished:
                 # The step totals are what the end position is checked
                 # against, so let the accounting catch up before reading it.
@@ -997,14 +1028,20 @@ class Machine(BaseMachine):
         logger.info('return home complete')
         send_wss_event(self._q_msg_tx, self.running_action_id, 'print:return_to_home:succeeded')
 
-    @staticmethod
-    def _dwell(phase: str) -> float:
+    def _dwell(self, phase: str) -> float:
         """Hold before a print's first fire, or after its last.
 
         ``phase`` is 'warm_up' or 'cool_down'. Returns the seconds waited, so
         a caller can log what a job actually spent. Configurable to zero for
         anyone who wants the machine to skip it, which is how it shipped
         before the factory's own timings were measured.
+
+        The wait is taken in short slices. The warm-up sits between the
+        button and the run with the armed session open, so it samples the
+        lid, the interlock loop and a service cancel between slices and
+        ends the job on any of them the way the waits around it do:
+        latch locked, disarmed, canceled. The cool-down follows a
+        finished job and is not supervised.
         """
         keys = {'warm_up': ('MOTION.WARM_UP_DELAY', WARM_UP_DEFAULT_S),
                 'cool_down': ('MOTION.COOL_DOWN_DELAY', COOL_DOWN_DEFAULT_S)}
@@ -1024,7 +1061,24 @@ class Machine(BaseMachine):
                         key, setting)
             return 0.0
         logger.info('%s: holding %.1f s', phase.replace('_', ' '), seconds)
-        sleep(seconds)
+        remaining = seconds
+        while remaining > 0:
+            if phase == 'warm_up':
+                abort = None
+                if self._running_action_cancelled:
+                    abort = 'canceled'
+                else:
+                    abort = self._enclosure_open(self._sw_thread.all_switches())
+                if abort is not None:
+                    logger.warning('warm up %s - the job does not start', abort)
+                    cnc.laser_latch(1)
+                    cooling_svc.set_armed(False)
+                    self._running_action_cancelled = True
+                    set_button_color(ButtonColor.OFF)
+                    return seconds - remaining
+            piece = min(DWELL_SLICE_S, remaining)
+            sleep(piece)
+            remaining -= piece
         return seconds
 
     @staticmethod
@@ -1124,9 +1178,17 @@ class Machine(BaseMachine):
         return False
 
     def _run_loop(self, park: bool = False, lid_gated: bool = True,
-                  pausable: bool = False, progress: '_JobProgress' = None) -> bool:
+                  pausable: bool = False, progress: '_JobProgress' = None,
+                  unlock_latch: bool = False) -> bool:
         """Play the loaded program. Returns True if the run was aborted
         (stopped before the program's end), False if it ran to completion.
+
+        ``unlock_latch`` is a print's: the laser latch is unlocked
+        immediately before the run starts, and nowhere earlier. Every
+        wait before this point (the button, the warm-up, the verdict)
+        runs with the latch locked, so a verdict that refuses fire before
+        the run never has to relock anything. The caller relocks when the
+        job ends. A motion, a hunt or a park never unlocks.
 
         Reactions during the run - the factory's, both modes alike:
           - lid or interlock loop opens: controlled stop, job canceled
@@ -1162,6 +1224,8 @@ class Machine(BaseMachine):
         self._button_edges = 0
         self._enclosure_edge = False
         self._run_wake.clear()
+        if unlock_latch:
+            cnc.laser_latch(0)
         cnc.run()
         # Wait for state transition
         wait_time = 20
