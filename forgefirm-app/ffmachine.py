@@ -264,7 +264,7 @@ def park_lens(half_steps: int) -> None:
 
 
 def request_header_capture(path: str) -> None:
-    """The commissioning wizard's request: the next print's pulse header
+    """The setup wizard's request: the next print's pulse header
     goes to `path` as JSON and that print is canceled before it arms. A
     one-shot: the machine clears the request as it writes the file."""
     set_cfg('CAPTURE.HEADER_PATH', path)

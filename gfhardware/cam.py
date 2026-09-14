@@ -147,7 +147,7 @@ def _ctrls_ov8856(subdev, exposure, gain):
 # stops at 1 Gbps, while 8-bit samples carry the same frame at half that -- and
 # the exposure/gain below are the OV5648 defaults translated into the OV8856's
 # units (the same fraction of the frame, the same gain multiple), a starting
-# point for commissioning rather than measured values.
+# point for setup rather than measured values.
 _SENSORS = {
     'ov5648': {
         'model': 'OV5648', 'width': 2592, 'height': 1944,

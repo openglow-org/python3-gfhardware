@@ -57,7 +57,7 @@ OFFLINE_MARKER = '/run/gfcloud-offline'
 OFFLINE_SOCKET = '/run/gfcloud-offline.sock'
 EMULATE_MARKER = '/run/gfcloud-emulate'
 NOHUNT_MARKER = '/run/gfcloud-nohunt'
-# The commissioning wizard's one-start request: capture the next print's
+# The setup wizard's one-start request: capture the next print's
 # pulse header for the daemon and cancel that print before it arms.
 CAPTURE_MARKER = '/run/gfcloud-capture'
 CAPTURE_PATH = '/run/forgefirm/cloud-header.json'

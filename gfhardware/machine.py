@@ -732,7 +732,7 @@ class Machine(BaseMachine):
                     ' '.join('%s=%s' % kv for kv in sorted(limits.items())) or 'none')
         capture = get_cfg('CAPTURE.HEADER_PATH') if msg['action_type'] == 'print' else None
         if capture:
-            # The commissioning wizard asked for this one header: keep it
+            # The setup wizard asked for this one header: keep it
             # for the daemon and cancel the print before anything arms.
             # The file is written once the print's terminal event is on
             # its way (motion()), so the daemon never sees the capture
@@ -792,7 +792,7 @@ class Machine(BaseMachine):
                 self._write_capture(*captured)
 
     def _capture_header(self, path: str, msg: dict, limits: dict) -> None:
-        """One pulse header for the commissioning record: every scalar tag
+        """One pulse header for the setup record: every scalar tag
         the service sent, kept for the daemon (written by motion() once the
         print's cancel is queued) and logged as one tagged block. The
         request is one-shot: the setting that carried it is cleared here,
