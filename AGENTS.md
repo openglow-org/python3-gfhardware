@@ -38,6 +38,13 @@ python3 -m pytest tests/
 - **The cloud client never installs factory firmware.** `update_check` is
   answered without the hand-off. `factory_reset` and `head_firmware_update`
   are refused.
+- **The latch unlocks after the verdict wait passes, immediately before
+  `cnc.run()`, never before the button wait.** Every wait before the run
+  keeps the latch locked.
+- **A failed `streaming=1` write is fatal.** The write is read back; a
+  live-fed run completes only when the feeder finished.
+- **A pulse body is checked for power-before-fire before it reaches the
+  ring.** The feeder refuses the chunk that would fire first.
 
 ## Project-wide rules
 
@@ -110,6 +117,9 @@ does.
   test with the fix, in the same commit, never after.
 - Position counters, homing anchors, and a homed flag are not proof of
   physical motion. The head accelerometer is, and so are the operator's eyes.
+- Unreadable is fail-closed. A failed read of a safety input, a state file,
+  or a verdict is never treated as "still running" or "keep waiting" without
+  a bound.
 
 ### Proof before done
 
