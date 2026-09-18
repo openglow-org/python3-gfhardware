@@ -36,3 +36,8 @@ with one third-party component under a different license:
 
 Binary packages built from this repository (including the ForgeFIRM image
 recipes) declare `MIT & LGPL-2.1-or-later` accordingly.
+
+---
+
+Glowforge is a trademark of Glowforge, Inc. This project is not affiliated
+with, authorized by, or endorsed by Glowforge, Inc.
