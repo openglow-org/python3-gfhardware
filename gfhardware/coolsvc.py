@@ -7,6 +7,7 @@ SPDX-License-Identifier:    MIT
 import json
 import logging
 import os
+import re
 import time
 from threading import Thread, Lock
 from urllib import parse, request
@@ -110,6 +111,13 @@ class CoolingService(Thread):
         self._limits = {}
         port = os.getenv('FORGECTRL_PORT', '80')
         self._url = 'http://127.0.0.1:%s/cool/state' % port
+        # The report channel is the running controller's alone: the
+        # supervisor hands each controller it spawns a secret, and the
+        # route asks for it. Read once and taken out of the environment,
+        # so nothing this process starts inherits it.
+        secret = os.environ.pop('GF_REPORT_SECRET', '')
+        self._headers = ({'X-ForgeFIRM-Report': secret}
+                         if re.fullmatch(r'[0-9a-f]{32}', secret) else {})
         Thread.__init__(self, daemon=True)
 
     # ------------------------------------------------------- job state
@@ -165,7 +173,7 @@ class CoolingService(Thread):
         try:
             request.urlopen(
                 request.Request('%s?%s' % (self._url, parse.urlencode(params)),
-                                method='POST'),
+                                headers=self._headers, method='POST'),
                 timeout=REPORT_TIMEOUT_S).close()
         except Exception as e:
             # Level-triggered: the next report self-heals. Nothing a
