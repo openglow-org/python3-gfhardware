@@ -33,6 +33,9 @@ gives up and goes silent. Two independent guards catch that: a run of
 near-identical motion corrections aborts the session, and the head
 accelerometer must have seen real motion at least once (it rides the
 gantry; bench-characterized thresholds) before quiet counts as homed.
+Nor does a service that went quiet after a motion that did not run
+whole (cancelled, stopped short): the head is short of the home, and
+the session fails at that motion's end.
 
 Exit codes: 0 = homed, 1 = configuration/connection failure,
 2 = homing did not complete.
@@ -215,6 +218,17 @@ def home(machine, args) -> int:
             if busy:
                 last_activity = now
             elif in_flight:
+                if in_flight == 'motion':
+                    # A motion that did not run whole (cancelled, stopped
+                    # short, refused, or crashed before its end) left the
+                    # head short of where the service sent it; the service
+                    # goes quiet all the same, and quiet would pass for homed.
+                    cancelled = getattr(machine, '_running_action_cancelled', False)
+                    if cancelled or not getattr(machine, '_motion_stats', {}).get('stats'):
+                        logger.error('a homing motion did not run whole (%s) - the head '
+                                     'is short of the home, NOT homed',
+                                     'cancelled' if cancelled else 'no end on record')
+                        return 2
                 logger.info('%s completed', in_flight)
                 done.add(in_flight)
                 if in_flight == 'motion':
