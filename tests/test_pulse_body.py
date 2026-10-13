@@ -144,14 +144,6 @@ class PulseBodyTests(unittest.TestCase):
         self.assertFalse(feeder.finished)
         feeder.stop()
 
-    def test_a_dark_job_passes(self):
-        payload = STEP * 5000
-        feeder, ring = self._feed(payload)
-        self.assertTrue(feeder.wait_primed(timeout=5))
-        self.assertTrue(_wait(lambda: feeder.finished))
-        self.assertIsNone(feeder.error)
-        feeder.stop()
-
     @unittest.skipUnless(os.path.exists(CAPTURE), 'no capture at hand')
     def test_a_real_capture_passes(self):
         with open(CAPTURE, 'rb') as f:

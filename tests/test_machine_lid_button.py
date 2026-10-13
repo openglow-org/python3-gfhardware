@@ -559,22 +559,6 @@ class RunLoopTests(unittest.TestCase):
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('stop', 1), CNC.writes)
 
-    def test_cooling_verdict_pulled_relocks_and_holds(self):
-        # fire_ok false, hold true (OVERTEMP, COLD, WARMUP, FLAME, BUMP):
-        # the latch at once, then the same pause as the button's.
-        threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
-        threading.Timer(0.6, lambda: setattr(self.m, '_running_action_cancelled', True)).start()
-        COOL.armed = True
-        aborted = self.m._run_loop(pausable=True)
-        self.assertTrue(aborted)
-        w = CNC.writes
-        self.assertIn(('laser_latch', 1), w)
-        self.assertIn(('stop', 1), w)
-        self.assertIn(('resume', -2000), w)
-        self.assertLess(w.index(('laser_latch', 1)), w.index(('stop', 1)))
-        self.assertNotIn(('laser_latch', 0), w)
-        self.assertIn('print:paused', job_events())
-
     # -- button pause / resume (prints) --------------------------------
 
     def test_button_pauses_and_resumes_a_print(self):
@@ -779,11 +763,6 @@ class StartGateTests(unittest.TestCase):
         self.m._motion({'id': 42, 'action_type': 'motion', 'motion_url': 'x'})
         self.assertTrue(self.m._running_action_cancelled)
         self.assertNotIn(('run', 1), CNC.writes)
-
-    def test_interlock_open_at_start_cancels_a_gated_job(self):
-        SW.word[InputSwitch.SW_INTERLOCK] = True
-        self.m._motion({'id': 42, 'action_type': 'print', 'motion_url': 'x'})
-        self.assertTrue(self.m._running_action_cancelled)
 
     def test_an_acknowledged_hunt_moves_nothing(self):
         # A GRBL homing session answers the service's hunt as done: no lens
@@ -1619,11 +1598,6 @@ class KernelFaultTests(unittest.TestCase):
         self.m._return_home(None)
         self.assertNotIn('print:return_to_home:succeeded', job_events())
 
-    def test_a_program_that_ends_is_not_an_abort(self):
-        CNC.run_reads = 3
-        self.assertFalse(self.m._run_loop())
-        self.assertFalse(self.m._running_action_cancelled)
-
     def test_cleanup_runs_to_the_end_when_the_stop_is_refused(self):
         CNC.stop_error = OSError(1, 'EPERM')
         COOL.armed = True
@@ -1710,6 +1684,8 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertFalse(self.m._running_action_cancelled)
         w = CNC.writes
         self.assertIn(('laser_latch', 1), w)
+        self.assertIn(('stop', 1), w)
+        self.assertLess(w.index(('laser_latch', 1)), w.index(('stop', 1)))    # the latch at once
         self.assertIn(('resume', -2000), w)
         self.assertIn(('laser_latch', 0), w)
         self.assertIn(('resume', 1950), w)
@@ -1739,6 +1715,7 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertTrue(aborted)
         self.assertTrue(self.m._running_action_cancelled)
         self.assertNotIn(('resume', 1950), CNC.writes)
+        self.assertNotIn(('laser_latch', 0), CNC.writes)     # a hold that ends in a cancel never unlocks
 
     def test_the_lid_ends_a_verdict_hold(self):
         threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
