@@ -727,6 +727,34 @@ class ButtonWaitTests(unittest.TestCase):
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('laser_latch', 1), CNC.writes)
 
+    def _short_timeout(self):
+        conf = machine_mod._conf_float
+        self.addCleanup(setattr, machine_mod, '_conf_float', conf)
+        machine_mod._conf_float = lambda key, default: (
+            1.0 if key == 'laser_button_timeout_s' else conf(key, default))
+
+    def test_a_button_held_before_the_wait_never_arms(self):
+        # No edge arrives (the switch thread's path); the level reads
+        # pressed from before the wait began and is never seen released,
+        # so the wait runs out and relocks rather than arming on it.
+        self._short_timeout()
+        SW.word[InputSwitch.SW_BUTTON] = True
+        self.m._button_wait({'id': 42})
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertFalse(COOL.armed)
+
+    def test_a_level_after_a_release_still_arms(self):
+        # The backstop for a gone switch thread: held, released, pressed
+        # again, all as levels with no edge, and the wait ends on the press.
+        self._short_timeout()
+        SW.word[InputSwitch.SW_BUTTON] = True
+        SW._later(0.2, lambda: SW.word.__setitem__(InputSwitch.SW_BUTTON, False))
+        SW._later(0.4, lambda: SW.word.__setitem__(InputSwitch.SW_BUTTON, True))
+        self.m._button_wait({'id': 42})
+        self.assertFalse(self.m._running_action_cancelled)
+        self.assertNotIn(('laser_latch', 1), CNC.writes)
+
 
 class StartGateTests(unittest.TestCase):
 
@@ -767,6 +795,23 @@ class StartGateTests(unittest.TestCase):
         SW.word[InputSwitch.SW_DOORS] = False
         self.assertTrue(self.m._safe_to_move(lid_gated=False))
         self.assertFalse(self.m._safe_to_move(lid_gated=True))
+
+    def _coolant(self, c):
+        self.addCleanup(setattr, machine_mod.temp_sensor.water_2, 'C', machine_mod.temp_sensor.water_2.C)
+        machine_mod.temp_sensor.water_2.C = c
+
+    def test_a_loop_over_the_start_limit_does_not_move(self):
+        # THERMAL.MAX_START_TEMP is 50 here; at the limit it still starts.
+        self._coolant(50.0)
+        self.assertTrue(self.m._safe_to_move())
+        self._coolant(50.5)
+        self.assertFalse(self.m._safe_to_move())
+
+    def test_a_dead_coolant_sensor_does_not_move(self):
+        # A dead or disconnected sensor reads the -273.15 sentinel, which
+        # must not pass as cold enough.
+        self._coolant(-273.15)
+        self.assertFalse(self.m._safe_to_move())
 
 
 if __name__ == '__main__':
