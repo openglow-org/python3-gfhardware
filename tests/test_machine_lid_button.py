@@ -526,10 +526,18 @@ class RunLoopTests(unittest.TestCase):
         self.assertIn(('stop', 1), CNC.writes)
 
     def test_underrun_while_paused_is_not_missed(self):
-        CNC.underrun_after = 3
+        # The job is paused (stopped, retraced, held idle) when the kernel
+        # reports a dry ring: the hold must not hide it. The job ends
+        # canceled, the underrun is acknowledged with a stop of its own,
+        # and the held job never resumes.
+        SW.press(delay=0.05)                       # pause
+        threading.Timer(0.4, lambda: setattr(CNC, '_state', MachineState.UNDERRUN)).start()
         aborted = self.m._run_loop(pausable=True)
         self.assertTrue(aborted)
         self.assertTrue(self.m._running_action_cancelled)
+        self.assertEqual(job_events(), ['print:paused'])
+        self.assertEqual(CNC.writes.count(('stop', 1)), 2)   # the pause, then the acknowledgement
+        self.assertFalse([w for w in CNC.writes if w[0] == 'resume' and w[1] > 0])
 
     def test_feed_failure_mid_run_stops_the_job(self):
         # The feeder cannot get the rest of the job into the ring: what is
