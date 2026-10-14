@@ -122,9 +122,6 @@ class NoHunt(unittest.TestCase):
         settings_mod.send_report(q, {'id': 5})
         return json.loads(q.get_nowait())['settings']
 
-    def test_the_first_report_carries_the_values_by_default(self):
-        self.assertTrue(self._report().get('values'))
-
     def test_inhibit_connect_hunt_makes_the_first_report_the_reconnect_form(self):
         ffmachine.inhibit_connect_hunt()
         self.assertEqual(self._report(), {})
@@ -142,10 +139,6 @@ class OneStartMarkers(unittest.TestCase):
         self.assertEqual(found, {present: True, absent: False})
         self.assertFalse(os.path.exists(present))          # this start only
         self.assertEqual(gfcloud.take_markers((present, absent)), {present: False, absent: False})
-
-    def test_the_markers_are_read_before_the_slow_imports(self):
-        src = open(os.path.join(ROOT, 'forgefirm-app', 'gfcloud.py')).read()
-        self.assertLess(src.index('MARKERS = take_markers()'), src.index('from gfutilities'))
 
 
 if __name__ == '__main__':

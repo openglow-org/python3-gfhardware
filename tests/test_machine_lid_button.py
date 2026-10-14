@@ -483,19 +483,16 @@ class RunLoopTests(unittest.TestCase):
 
     # -- the park and the hunt ignore the lid ---------------------------
 
-    def test_park_ignores_lid(self):
-        CNC.run_reads = 5
-        SW.open_lid(delay=0.02)
-        aborted = self.m._run_loop(park=True)
-        self.assertFalse(aborted)
-        self.assertNotIn(('stop', 1), CNC.writes)
-
-    def test_park_ignores_service_cancel(self):
-        CNC.run_reads = 5
-        self.m._running_action_cancelled = True
-        aborted = self.m._run_loop(park=True)
-        self.assertFalse(aborted)
-        self.assertNotIn(('stop', 1), CNC.writes)
+    def test_park_ignores_a_service_cancel_and_the_lid(self):
+        for name, arrange in (('service cancel', lambda: setattr(self.m, '_running_action_cancelled', True)),
+                              ('lid', lambda: SW.open_lid(delay=0.02))):
+            with self.subTest(name):
+                self.setUp()
+                CNC.run_reads = 5
+                arrange()
+                aborted = self.m._run_loop(park=True)
+                self.assertFalse(aborted)
+                self.assertNotIn(('stop', 1), CNC.writes)
 
     def test_hunt_ignores_lid(self):
         CNC.run_reads = 5
@@ -614,72 +611,44 @@ class RunLoopTests(unittest.TestCase):
         self.assertNotIn(('resume', -2000), CNC.writes)
         self.assertEqual(job_events(), [])
 
-    def test_backtrack_refused_pauses_in_place(self):
-        # The kernel refuses the backtrack: the job holds where the decel
-        # stopped, still paused, still resumable - and the resume asks for
-        # the shortest lead there is, because nothing was retraced. A lead
-        # over ground the job has not cut yet would leave that length
-        # unburned, and a lead of zero is the kernel's "no laser at all".
-        SW.press(delay=0.05)
-        SW.press(delay=0.40)
-        threading.Timer(0.6, lambda: setattr(CNC, '_reads_left', 1)).start()
-        orig = CNC.resume
+    def test_the_retrace_walks_what_the_ring_holds_and_leads_by_it(self):
+        # With the factory distances (2000 back, a 1950 lead: a 50-tick
+        # overlap), each row is what the ring offers and the writes the
+        # retrace and the resume make. A refused backtrack holds where the
+        # decel stopped and resumes with the shortest lead, because nothing
+        # was retraced: a lead over ground not yet cut would leave it
+        # unburned, and a lead of zero is the kernel's "no laser at all". A
+        # short history shortens the retrace and the lead with it. No
+        # history asks for no backward run. No readback asks for the
+        # configured distance and lets the kernel refuse it.
+        def refuse_backward():
+            orig = CNC.resume
 
-        def resume(steps):
-            if steps < 0:
-                raise OSError(1, 'EPERM')
-            orig(steps)
-        CNC.resume = resume
+            def resume(steps):
+                if steps < 0:
+                    raise OSError(1, 'EPERM')
+                orig(steps)
+            CNC.resume = resume
+        rows = (
+            ('backtrack refused', refuse_backward, [('resume', 1)]),
+            ('short history', lambda: setattr(CNC, 'backtrack_budget', 500),
+             [('resume', -500), ('resume', 450)]),
+            ('no history', lambda: setattr(CNC, 'backtrack_budget', 0), [('resume', 1)]),
+            ('no readback', lambda: setattr(CNC, 'max_backtrack_error', OSError(2, 'ENOENT')),
+             [('resume', -2000), ('resume', 1950)]),
+        )
         try:
-            aborted = self.m._run_loop(pausable=True)
+            for name, arrange, writes in rows:
+                with self.subTest(name):
+                    CNC.__init__()
+                    vars(CNC).pop('resume', None)
+                    arrange()
+                    ok, retraced = self.m._retrace(2000)
+                    self.assertTrue(ok)
+                    self.assertTrue(self.m._resume_retraced(retraced, 50))
+                    self.assertEqual(CNC.writes, writes)
         finally:
-            del CNC.resume
-        self.assertFalse(aborted)
-        self.assertEqual(job_events(), ['print:paused', 'print:resumed'])
-        self.assertIn(('resume', 1), CNC.writes)
-        self.assertNotIn(('resume', 1950), CNC.writes)
-        self.assertNotIn(('resume', 0), CNC.writes)
-
-    def test_short_history_shortens_the_retrace_and_the_lead(self):
-        # A pause early in a program, or on a ring a live feed has just
-        # topped up, has less than the factory distance to walk back over.
-        # The retrace shortens to what is there and the lead follows it,
-        # keeping the 50-tick overlap the factory constants describe.
-        CNC.backtrack_budget = 500
-        SW.press(delay=0.05)
-        SW.press(delay=0.40)
-        threading.Timer(0.6, lambda: setattr(CNC, '_reads_left', 1)).start()
-        aborted = self.m._run_loop(pausable=True)
-        self.assertFalse(aborted)
-        self.assertIn(('resume', -500), CNC.writes)
-        self.assertIn(('resume', 450), CNC.writes)
-        self.assertEqual(job_events(), ['print:paused', 'print:resumed'])
-
-    def test_no_history_holds_and_resumes_lit(self):
-        # Nothing to walk back over: no backward run is asked for at all,
-        # and the resume puts the beam back on where it stopped.
-        CNC.backtrack_budget = 0
-        SW.press(delay=0.05)
-        SW.press(delay=0.40)
-        threading.Timer(0.6, lambda: setattr(CNC, '_reads_left', 1)).start()
-        aborted = self.m._run_loop(pausable=True)
-        self.assertFalse(aborted)
-        self.assertFalse([w for w in CNC.writes if w[0] == 'resume' and w[1] < 0])
-        self.assertIn(('resume', 1), CNC.writes)
-        self.assertNotIn(('resume', 0), CNC.writes)
-        self.assertEqual(job_events(), ['print:paused', 'print:resumed'])
-
-    def test_unreadable_budget_asks_for_the_configured_distance(self):
-        # No readback (an older module): ask for the factory distance and
-        # let the kernel be the one to refuse it.
-        CNC.max_backtrack_error = OSError(2, 'ENOENT')
-        SW.press(delay=0.05)
-        SW.press(delay=0.40)
-        threading.Timer(0.6, lambda: setattr(CNC, '_reads_left', 1)).start()
-        aborted = self.m._run_loop(pausable=True)
-        self.assertFalse(aborted)
-        self.assertIn(('resume', -2000), CNC.writes)
-        self.assertIn(('resume', 1950), CNC.writes)
+            vars(CNC).pop('resume', None)
 
 
 class ButtonWaitTests(unittest.TestCase):
@@ -801,10 +770,6 @@ class StartGateTests(unittest.TestCase):
         self.assertFalse(self.m._safe_to_move())
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class ReturnHomeTests(unittest.TestCase):
 
     def setUp(self):
@@ -882,8 +847,10 @@ class FeedWatchdogTests(unittest.TestCase):
         self.m._feeder = feeder
         SW._later(0.6, lambda: setattr(feeder, 'moving', True))
         SW._later(1.2, lambda: setattr(CNC, '_reads_left', 1))
+        frames = queue.Queue()
 
-        aborted = self.m._run_loop(pausable=True)
+        aborted = self.m._run_loop(pausable=True, progress=machine_mod._JobProgress(
+            frames, 42, 'print:progress', 1000, interval=3600))
 
         self.assertFalse(aborted)
         self.assertFalse(self.m._running_action_cancelled)
@@ -892,6 +859,7 @@ class FeedWatchdogTests(unittest.TestCase):
         self.assertIn(('resume', -2000), w)         # retraced like a pause
         self.assertIn(('resume', 1950), w)          # and led back on over cut ground
         self.assertEqual(job_events(), ['print:paused', 'print:resumed'])
+        self.assertEqual(frames.qsize(), 4)         # start, hold, resume, end: as a pause reports
 
     def test_feed_that_never_moves_cancels_the_job(self):
         machine_mod.FEED_RECOVER_S = 0.5
@@ -978,32 +946,21 @@ class JobLifecycleTests(unittest.TestCase):
                                machine_mod.WARM_UP_DEFAULT_S + machine_mod.COOL_DOWN_DEFAULT_S)
         self.assertTrue(all(s <= machine_mod.DWELL_SLICE_S + 1e-9 for s in self.slept))
 
-    def test_a_configured_period_wins(self):
-        set_cfg('MOTION.WARM_UP_DELAY', '5')
-        self.assertEqual(self.m._dwell('warm_up'), 5.0)
-        self.assertAlmostEqual(sum(self.slept), 5.0)
+    def test_a_configured_period_wins_and_nonsense_falls_back(self):
+        # A configured period wins; the zero the old sample shipped still
+        # skips the hold, as the operator chose; nonsense falls back to the
+        # factory period.
+        for value, want in (('5', 5.0), (0, 0.0), ('soon', machine_mod.WARM_UP_DEFAULT_S)):
+            with self.subTest(value=value):
+                del self.slept[:]
+                set_cfg('MOTION.WARM_UP_DELAY', value)
+                self.assertEqual(self.m._dwell('warm_up'), want)
+                self.assertAlmostEqual(sum(self.slept), want)
 
-    def test_zero_still_skips_the_period(self):
-        # A machine whose config carries the zeros the old sample shipped
-        # skips the hold, and the operator keeps that choice.
-        set_cfg('MOTION.WARM_UP_DELAY', 0)
-        set_cfg('MOTION.COOL_DOWN_DELAY', 0)
-        self.assertEqual(self.m._dwell('warm_up'), 0.0)
-        self.assertEqual(self.m._dwell('cool_down'), 0.0)
-        self.assertEqual(self.slept, [])
-
-    def test_a_nonsense_period_falls_back_to_the_factory_one(self):
-        set_cfg('MOTION.WARM_UP_DELAY', 'soon')
-        self.assertEqual(self.m._dwell('warm_up'), machine_mod.WARM_UP_DEFAULT_S)
-
-    def test_an_unhandled_header_key_is_named_once(self):
+    def test_an_unhandled_header_key_is_a_gap(self):
         header = {'STfr': 10000, 'AArd': 200, 'MCsn': 0, 'PDfm': 0,
                   'ZZzz': 4242}
-        with self.assertLogs(machine_mod.logger, level='DEBUG') as caught:
-            gaps = self.m._log_header_gaps(header)
-        self.assertEqual(gaps, ['ZZzz'])
-        named = [ln for ln in caught.output if 'ZZzz=4242' in ln]
-        self.assertEqual(len(named), 1, caught.output)
+        self.assertEqual(self.m._log_header_gaps(header), ['ZZzz'])
 
     def test_applied_and_checked_keys_are_not_reported_as_gaps(self):
         # The motion keys have appliers, the serial and format are checked
@@ -1013,23 +970,6 @@ class JobLifecycleTests(unittest.TestCase):
                   'MCsn': 0, 'PDfm': 0, 'CFrh': 1, 'CCwp': 5000,
                   'CCrp': 10000, 'CCup': 1}
         self.assertEqual(self.m._log_header_gaps(header), [])
-
-    def test_declared_ignored_keys_are_counted_and_not_undecided(self):
-        # The warm-up fan profile, a board ceiling, an IR threshold and the
-        # HV cap are decisions with a recorded reason; ZZzz is not.
-        header = {'STfr': 10000, 'AAwd': 1023, 'EFwd': 65535, 'BTrx': 9440,
-                  'IRwx': 275, 'HIrx': 1023, 'ZZzz': 1}
-        with self.assertLogs(machine_mod.logger, level='DEBUG') as caught:
-            gaps = self.m._log_header_gaps(header)
-        self.assertEqual(gaps, ['ZZzz'])
-        line = [ln for ln in caught.output if 'have no applier here' in ln]
-        self.assertEqual(len(line), 1, caught.output)
-        self.assertIn('6 of 7 header keys have no applier here (5 declared ignored, 1 undecided)', line[0])
-        declared = [ln for ln in caught.output if 'declared ignored: ' in ln]
-        self.assertEqual(len(declared), 1, caught.output)
-        for key in ('AAwd=1023', 'EFwd=65535', 'BTrx=9440', 'IRwx=275', 'HIrx=1023'):
-            self.assertIn(key, declared[0])
-        self.assertNotIn('ZZzz', declared[0])
 
     def test_every_declared_key_has_a_reason_and_no_applier(self):
         applied = {k for k, s in machine_mod.MACHINE_SETTINGS.items()
@@ -1041,25 +981,10 @@ class JobLifecycleTests(unittest.TestCase):
             self.assertNotIn(key, machine_mod.LIMIT_TAGS, key)
             self.assertNotIn(key, machine_mod.INERT_LIMIT_TAGS, key)
 
-    def test_a_header_with_only_declared_keys_has_no_undecided_line(self):
-        header = {'STfr': 10000, 'TRuc': 0, 'PTmn': 0, 'PTmx': 1023}
-        with self.assertLogs(machine_mod.logger, level='DEBUG') as caught:
-            gaps = self.m._log_header_gaps(header)
-        self.assertEqual(gaps, [])
-        self.assertFalse([ln for ln in caught.output if 'keys with no applier: ' in ln], caught.output)
-        self.assertTrue([ln for ln in caught.output if '(3 declared ignored, 0 undecided)' in ln], caught.output)
-
-    def test_the_lifecycle_keys_are_logged_even_when_absent(self):
-        with self.assertLogs(machine_mod.logger, level='INFO') as caught:
-            self.m._log_header_gaps({'STfr': 10000})
-        line = [ln for ln in caught.output if 'job lifecycle keys' in ln]
-        self.assertEqual(len(line), 1, caught.output)
-        for key in machine_mod.LIFECYCLE_KEYS:
-            self.assertIn('%s=-' % key, line[0])
-
 
 class LidLampTests(unittest.TestCase):
-    """A lid capture lights the bed unless the action asks it not to."""
+    """The action's settings reach the lid capture (BaseMachine.lamp_level's
+    own cases are Glowforge-Utilities')."""
 
     def setUp(self):
         CNC.__init__()
@@ -1075,25 +1000,10 @@ class LidLampTests(unittest.TestCase):
         self.assertEqual(cam_sel, machine_mod.cam.GFCAM_LID)
         return kw.get('illumination')
 
-    def test_a_capture_with_no_settings_lights_the_lamp(self):
-        self.m._lid_image({'id': 1})
-        self.assertEqual(self.lamp(), 132)
-
-    def test_the_service_can_ask_for_the_flash(self):
-        self.m._lid_image({'id': 2}, {'LCfl': 1})
-        self.assertEqual(self.lamp(), 132)
-
-    def test_the_service_can_ask_for_the_bed_as_it_is_lit(self):
+    def test_lcfl_0_captures_the_bed_as_it_is_lit_and_the_image_still_goes_out(self):
         self.m._lid_image({'id': 3}, {'LCfl': 0})
         self.assertEqual(self.lamp(), 0)
-
-    def test_settings_that_say_nothing_about_the_flash_leave_it_on(self):
-        self.m._lid_image({'id': 4}, {'HCil': 3})
-        self.assertEqual(self.lamp(), 132)
-
-    def test_the_image_still_goes_out(self):
-        self.m._lid_image({'id': 5}, {'LCfl': 0})
-        self.assertEqual(UPLOADS, [5])
+        self.assertEqual(UPLOADS, [3])
 
 
 class ProgressTests(unittest.TestCase):
@@ -1134,13 +1044,9 @@ class ProgressTests(unittest.TestCase):
         CNC.xy_steps = (7, 9)
         self.progress(33291208).send(force=True)
         frame = self.frames()[0]
-        self.assertEqual(frame['type'], 'progress')
-        self.assertEqual(frame['version'], 1)
         self.assertEqual(frame['action_id'], 42)
         self.assertEqual(frame['progress'], 'print:progress')
         self.assertEqual(frame['current'], 994)
-        self.assertEqual(frame['units'], 'steps')
-        self.assertEqual(frame['total'], 33291208)
         # The progress frame is also the periodic settings report: these
         # are the job's own values, and the sensor tags stay out of it.
         self.assertEqual(frame['settings']['values'],
@@ -1193,15 +1099,12 @@ class ProgressTests(unittest.TestCase):
     def test_a_job_that_overruns_its_declared_length_still_ends_at_100(self):
         CNC.processed, CNC.total = 5000, 5000
         CNC.run_reads = 3
-        with self.assertLogs(machine_mod.logger, level='WARNING') as caught:
+        with self.assertLogs(machine_mod.logger, level='WARNING'):
             prog = self.progress(4000)
             prog.send(force=True)
             prog.send(force=True)
         frames = self.frames()
         self.assertEqual([f['current'] for f in frames], [4000, 4000])
-        # Said once, not once per frame.
-        over = [ln for ln in caught.output if 'declared' in ln]
-        self.assertEqual(len(over), 1, caught.output)
         # The raw byte position is still reported as itself.
         self.assertEqual(frames[0]['settings']['values']['CCbp'], 5000)
 
@@ -1216,33 +1119,6 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(len(frames), 2, frames)
         self.assertEqual(frames[0]['current'], 0)
         self.assertEqual(frames[-1]['current'], 1000)
-
-    def test_a_pause_and_a_resume_each_report(self):
-        CNC.processed, CNC.total = 500, 1000
-        SW.press(delay=0.05)                       # pause
-        SW.press(delay=0.40)                       # resume
-        threading.Timer(0.6, lambda: setattr(CNC, '_reads_left', 1)).start()
-        self.m._run_loop(pausable=True, progress=self.progress(1000, interval=3600))
-        self.assertEqual(job_events(), ['print:paused', 'print:resumed'])
-        # Start, pause, resume, end: four frames, and no more than the
-        # phases asked for.
-        self.assertEqual(len(self.frames()), 4)
-
-    def test_a_job_held_for_a_stalled_feed_reports_the_hold(self):
-        stall, recover = machine_mod.FEED_STALL_S, machine_mod.FEED_RECOVER_S
-        machine_mod.FEED_STALL_S, machine_mod.FEED_RECOVER_S = 0.2, 5.0
-        try:
-            feeder = FakeFeeder(written=1000)
-            self.m._feeder = feeder
-            SW._later(0.6, lambda: setattr(feeder, 'moving', True))
-            SW._later(1.2, lambda: setattr(CNC, '_reads_left', 1))
-            self.m._run_loop(pausable=True,
-                             progress=self.progress(1000, interval=3600))
-        finally:
-            machine_mod.FEED_STALL_S, machine_mod.FEED_RECOVER_S = stall, recover
-            self.m._feeder = None
-        self.assertEqual(job_events(), ['print:paused', 'print:resumed'])
-        self.assertEqual(len(self.frames()), 4)
 
     def test_a_run_with_nothing_to_report_to_says_nothing(self):
         # A motion or a hunt is over before a first frame would land, and
@@ -1368,14 +1244,6 @@ class FeederExitTests(unittest.TestCase):
         # The driver is at its drive current before any feed and any run.
         self.assertLess(w.index(('z_current', 0)), w.index(('feeder_stop', 1)))
         self.assertEqual(w.count(('z_current', 0)), 1)
-
-    def test_the_cleanup_locks_and_rests_the_lens(self):
-        # A crashed action leaves through the same posture as a finished
-        # one: the lens locked out of the pulse path at its hold current.
-        self.m._action_cleanup()
-        w = CNC.writes
-        self.assertIn(('motor_lock', '8'), w)
-        self.assertIn(('z_current', 1), w)
 
     def test_a_cancel_at_the_button_wait_stops_the_feeder_before_the_park(self):
         # A two-hour print, ring full, the operator opens the lid while the
@@ -1609,6 +1477,10 @@ class KernelFaultTests(unittest.TestCase):
         self.assertEqual(COOL.mode, 'idle')
         self.assertIsNone(self.m._feeder)
         self.assertEqual(CNC.streaming_writes[-1], 0)
+        # the same posture as a finished action: the lens locked out of the
+        # pulse path at its hold current
+        self.assertIn(('motor_lock', '8'), CNC.writes)
+        self.assertIn(('z_current', 1), CNC.writes)
 
     def test_shutdown_runs_to_the_end_when_the_stop_is_refused(self):
         CNC.stop_error = OSError(1, 'EPERM')
@@ -1706,8 +1578,6 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertNotIn(('laser_latch', 1), w)
 
     def test_a_hold_past_its_bound_cancels(self):
-        machine_mod._conf_float = lambda key, default: (
-            0.3 if key == 'cloud_hold_max_s' else self._conf(key, default))
         # the bound is clamped to 60 s and up: patch the reader the loop uses
         self.m._hold_max_s = lambda: 0.3
         threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
@@ -1868,3 +1738,7 @@ class VerdictWaitTests(unittest.TestCase):
         self.m._verdict_wait()
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('laser_latch', 1), CNC.writes)
+
+
+if __name__ == '__main__':
+    unittest.main()

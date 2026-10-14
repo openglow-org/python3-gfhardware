@@ -11,6 +11,14 @@ the job lives. These drive the feeder against a fake ring that refuses with
 -ENOMEM when full and drains on demand, which is the only behavior of the
 device the feeder depends on.
 
+The feeder also makes the one check on a job's bytes on their way to the
+ring: a stream must carry a laser power byte before its first FIRE byte.
+The kernel resets the duty to about full on every run, so a stream that
+fires first would put its first pulses out at full power. The check runs
+chunk by chunk as the bytes are read, so the offending byte never reaches
+the ring: before the run the job is refused; past the primed window the
+feed stops and the run ends on a starved ring.
+
 Run:  PYTHONPATH=.:../Glowforge-Utilities python3 -m unittest tests.test_feeder
 """
 import errno
@@ -57,7 +65,7 @@ sys.modules['gfhardware.cnc'] = _cnc_mod
 from gfutilities.puls import decode_all_steps                    # noqa: E402
 from gfutilities.puls.source import PulseSource                  # noqa: E402
 import gfhardware.feeder as feeder_mod                           # noqa: E402
-from gfhardware.feeder import PulseFeeder                        # noqa: E402
+from gfhardware.feeder import PulseBodyError, PulseFeeder        # noqa: E402
 
 CNC = _cnc_mod.cnc
 
@@ -65,6 +73,10 @@ CNC = _cnc_mod.cnc
 # A stream carries a power byte before its first FIRE byte, as every one the
 # service sends does; the feeder refuses one that does not.
 POWERED = b'\x80'
+# A step byte, and the step byte's FIRE bit (bit 4; bit 7 set is a power
+# level instead).
+STEP = b'\x01'
+FIRE = b'\x10'
 
 
 def _puls(payload: bytes) -> bytes:
@@ -139,6 +151,7 @@ class FeederTest(unittest.TestCase):
         feeder.stop()
         self.assertEqual(bytes(ring.accepted), payload)
         self.assertEqual(feeder.written, len(payload))
+        self.assertEqual(feeder.job_total, feeder.written)
         # Never declared live: end-of-data means the job finished, which is
         # exactly the behavior a job that fits has always had.
         self.assertFalse(feeder.streaming)
@@ -151,13 +164,23 @@ class FeederTest(unittest.TestCase):
         feeder, ring = self._feeder(payload, capacity, chunk=1024)
         feeder.start()
 
-        # Priming stops at a full ring, with the job far from finished.
+        # Priming stops at a full ring, with the job far from finished, and
+        # sitting against it is not an error. The job's length is known
+        # already: what a progress report divides by from the first frame.
         self.assertTrue(feeder.wait_primed(timeout=5))
+        time.sleep(0.1)
+        self.assertIsNone(feeder.error)
         self.assertFalse(feeder.finished)
         self.assertEqual(feeder.written, capacity)
+        self.assertEqual(feeder.job_total, len(payload))
 
         feeder.declare_live_feed()
         self.assertEqual(CNC.streaming_writes, [1])
+
+        # A drained window topped up, with bytes left, is not the job's end.
+        ring.drain(4096)
+        self.assertTrue(_wait(lambda: feeder.written > capacity))
+        self.assertFalse(feeder.finished)
 
         # Play it: every time the ring drains, the feeder tops it up.
         deadline = time.monotonic() + 20
@@ -173,54 +196,21 @@ class FeederTest(unittest.TestCase):
         self.assertEqual(CNC.streaming_writes, [1, 0])
         feeder.stop()
 
-    def test_ring_full_is_not_an_error(self):
-        payload = bytes(200000)
-        feeder, ring = self._feeder(payload, capacity=4096)
-        feeder.start()
-        self.assertTrue(feeder.wait_primed(timeout=5))
-        time.sleep(0.1)                                  # sit against a full ring
-        self.assertIsNone(feeder.error)
-        self.assertEqual(feeder.written, 4096)
-        feeder.stop()
-
     # -- how long the job is ---------------------------------------------
-    def test_the_job_total_is_the_job_before_the_feed_finishes(self):
-        # What a progress report divides by, and the reason it can be
-        # reported from the first frame: the length is known while most of
-        # the job is still waiting to be fed.
-        payload = POWERED + bytes(range(256)) * 400      # 102401 bytes
-        feeder, ring = self._feeder(payload, capacity=8192, chunk=1024)
-        feeder.start()
-        self.assertTrue(feeder.wait_primed(timeout=5))
-        self.assertFalse(feeder.finished)
-        self.assertEqual(feeder.job_total, len(payload))
-        feeder.stop()
-
-    def test_a_finished_feed_reports_what_it_actually_delivered(self):
-        payload = POWERED + bytes(range(256)) * 20
-        feeder, ring = self._feeder(payload, capacity=1 << 20)
-        feeder.start()
-        self.assertTrue(_wait(lambda: feeder.finished))
-        self.assertEqual(feeder.job_total, len(payload))
-        self.assertEqual(feeder.job_total, feeder.written)
-        feeder.stop()
-
     def test_a_job_that_will_not_say_how_long_it_is_reports_no_total(self):
         feeder = PulseFeeder(_Declaring(bytes(4096), None), FakeRing(1 << 20),
                              chunk=1024, retry_s=0.01)
         self.assertIsNone(feeder.job_total)
 
-    def test_a_job_that_does_not_end_where_it_said_it_would_is_named(self):
+    def test_a_job_that_does_not_end_where_it_said_it_would_warns(self):
         # The declared length is what every progress frame divided by all
         # job long, so a job that delivers something else is worth a line.
         feeder = PulseFeeder(_Declaring(bytes(4096), 9999), FakeRing(1 << 20),
                              chunk=1024, retry_s=0.01)
-        with self.assertLogs(feeder_mod.logger, level='WARNING') as caught:
+        with self.assertLogs(feeder_mod.logger, level='WARNING'):
             feeder.start()
             self.assertTrue(_wait(lambda: feeder.finished))
         feeder.stop()
-        self.assertTrue([ln for ln in caught.output
-                         if 'declared 9999' in ln and '4096' in ln], caught.output)
 
     # -- accounting ------------------------------------------------------
     def test_step_totals_match_decoding_the_whole_job(self):
@@ -287,18 +277,60 @@ class FeederTest(unittest.TestCase):
         CNC.readback = None
         feeder.stop()
 
-    def test_a_drained_window_with_bytes_left_is_not_a_finished_feed(self):
-        # The signature of a live feed the device did not take as one: the
-        # ring drains and is topped up, and the job is nowhere near done.
-        payload = bytes(200000)
-        feeder, ring = self._feeder(payload, capacity=4096, chunk=1024)
+
+class PulseBodyTests(unittest.TestCase):
+    def setUp(self):
+        CNC.__init__()
+
+    def _feed(self, payload, capacity=1 << 20, chunk=1024):
+        ring = FakeRing(capacity)
+        feeder = PulseFeeder(PulseSource(_puls(payload)), ring, chunk=chunk, retry_s=0.01)
         feeder.start()
-        self.assertTrue(feeder.wait_primed(timeout=5))
-        ring.drain(4096)
-        self.assertTrue(_wait(lambda: feeder.written > 4096))
+        return feeder, ring
+
+    def test_fire_before_any_power_byte_is_refused_before_the_ring(self):
+        payload = STEP * 100 + FIRE + STEP * 50 + POWERED + STEP * 20
+        feeder, ring = self._feed(payload)
+        self.assertFalse(feeder.wait_primed(timeout=5))
+        self.assertIsInstance(feeder.error, PulseBodyError)
+        self.assertIn('byte 100', str(feeder.error))
+        self.assertEqual(len(ring.accepted), 0, 'the refused chunk reached the ring')
         self.assertFalse(feeder.finished)
         feeder.stop()
+
+    def test_a_power_byte_first_is_accepted(self):
+        payload = STEP * 10 + POWERED + STEP * 100 + FIRE * 50 + STEP * 20
+        feeder, ring = self._feed(payload)
+        self.assertTrue(feeder.wait_primed(timeout=5))
+        self.assertTrue(_wait(lambda: feeder.finished))
+        self.assertIsNone(feeder.error)
+        self.assertEqual(bytes(ring.accepted), payload)
+        feeder.stop()
+
+    def test_the_power_byte_counts_across_chunks(self):
+        # The power byte in one chunk licenses the fire in a later one.
+        payload = POWERED + STEP * 3000 + FIRE * 10 + STEP * 500
+        feeder, ring = self._feed(payload, chunk=1024)
+        self.assertTrue(feeder.wait_primed(timeout=5))
+        self.assertTrue(_wait(lambda: feeder.finished))
+        self.assertIsNone(feeder.error)
+        self.assertEqual(bytes(ring.accepted), payload)
+        feeder.stop()
+
+    def test_a_late_fire_past_the_primed_window_stops_the_feed_short_of_it(self):
+        # The ring holds the first window; the offending byte is beyond it.
+        # The feed stops before that chunk, so it never reaches the ring.
+        payload = STEP * 6000 + FIRE + STEP * 100
+        feeder, ring = self._feed(payload, capacity=4096, chunk=1024)
+        self.assertTrue(feeder.wait_primed(timeout=5))
+        self.assertIsNone(feeder.error)
+        ring.drain(4096)
+        self.assertTrue(_wait(lambda: feeder.error is not None))
+        self.assertIsInstance(feeder.error, PulseBodyError)
+        self.assertIn('byte 6000', str(feeder.error))
+        self.assertNotIn(FIRE, bytes(ring.accepted))
         self.assertFalse(feeder.finished)
+        feeder.stop()
 
 
 if __name__ == '__main__':

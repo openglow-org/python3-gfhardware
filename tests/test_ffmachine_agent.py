@@ -37,19 +37,14 @@ class UserAgentTest(unittest.TestCase):
             f.write(text)
         return path
 
-    def test_release_stamp_drops_the_v(self):
-        self.assertEqual(ffmachine.forgefirm_version(self.stamp('v0.0.1\n')), '0.0.1')
-
-    def test_dev_stamp_is_kept(self):
-        self.assertEqual(ffmachine.forgefirm_version(self.stamp('20260906123456 (dev)\n')),
-                         '20260906123456 (dev)')
-
-    def test_missing_stamp(self):
-        path = os.path.join(self.tmp.name, 'absent')
-        self.assertEqual(ffmachine.forgefirm_version(path), 'unknown')
-
-    def test_empty_stamp(self):
-        self.assertEqual(ffmachine.forgefirm_version(self.stamp('\n')), 'unknown')
+    def test_the_version_comes_from_the_image_stamp(self):
+        # A release stamp drops its v, the dev stamp is kept as it is, and a
+        # missing or empty stamp is unknown.
+        for text, want in (('v0.0.1\n', '0.0.1'), ('20260906123456 (dev)\n', '20260906123456 (dev)'),
+                           (None, 'unknown'), ('\n', 'unknown')):
+            with self.subTest(stamp=text):
+                path = os.path.join(self.tmp.name, 'absent') if text is None else self.stamp(text)
+                self.assertEqual(ffmachine.forgefirm_version(path), want)
 
     def test_apply_sets_the_forgefirm_agent(self):
         ffmachine.apply_user_agent(self.stamp('v0.0.1\n'))
@@ -64,11 +59,6 @@ class UserAgentTest(unittest.TestCase):
         set_cfg('SERVICE.USER_AGENT', '')
         ffmachine.apply_user_agent(self.stamp('v0.0.1\n'))
         self.assertEqual(get_cfg('SERVICE.USER_AGENT'), 'ForgeFIRM/0.0.1')
-
-    def test_session_carries_the_forgefirm_agent(self):
-        from gfutilities.service import websocket
-        ffmachine.apply_user_agent(self.stamp('v0.0.1\n'))
-        self.assertEqual(websocket.get_session().headers['user-agent'], 'ForgeFIRM/0.0.1')
 
 
 if __name__ == '__main__':

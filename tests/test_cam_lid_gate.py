@@ -79,19 +79,17 @@ class CaptureGateTest(unittest.TestCase):
             setattr(cam_mod, name, fn)
 
     def test_refuses_with_lid_open(self):
+        # The refusal is a PermissionError, which the cloud client tells
+        # apart from a hardware failure, and it comes before anything is
+        # touched: the lamp (write_attr) included.
         self.lid = False
         for cam_sel in (cam_mod.GFCAM_LID, cam_mod.GFCAM_HEAD):
             self.touched.clear()
-            with self.assertRaises(cam_mod.LidOpen):
+            with self.assertRaises(cam_mod.LidOpen) as cm:
                 cam_mod.capture(cam_sel)
+            self.assertIsInstance(cm.exception, PermissionError)
             self.assertEqual(self.touched, [],
                              'a refused capture touched the machine: %r' % self.touched)
-
-    def test_lid_open_refusal_is_not_a_generic_error(self):
-        """The cloud client tells a refusal apart from a hardware failure."""
-        self.lid = False
-        with self.assertRaises(PermissionError):
-            cam_mod.capture(cam_mod.GFCAM_LID)
 
     def test_captures_with_lid_closed(self):
         self.lid = True
@@ -110,15 +108,6 @@ class CaptureGateTest(unittest.TestCase):
         kinds = [t[0] for t in self.touched]
         self.assertIn('grab', kinds, 'a permitted capture never reached the grabber')
         self.assertIn('v4l2-ctl', kinds, 'the sensor was never configured')
-
-    def test_lid_is_read_before_anything_else(self):
-        """Ordering matters: a refusal must not leave the lamp raised."""
-        order = []
-        cam_mod.lid_closed = lambda *a, **kw: (order.append('lid'), False)[1]
-        cam_mod.write_attr = lambda *a: order.append('lamp')
-        with self.assertRaises(cam_mod.LidOpen):
-            cam_mod.capture(cam_mod.GFCAM_LID)
-        self.assertEqual(order, ['lid'])
 
 
 class LidClosedFailsClosedTest(unittest.TestCase):

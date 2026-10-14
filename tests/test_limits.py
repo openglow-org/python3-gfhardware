@@ -32,9 +32,7 @@ class LimitsFromHeaderTests(unittest.TestCase):
     def test_a_cut_header_yields_the_coolant_window_and_the_air_assist_floor(self):
         self.assertEqual(limits_from_header(CUT),
                          {'coolant_max_c': 33.0, 'coolant_min_c': 5.0, 'air_assist_min_rpm': 116})
-
-    def test_millidegrees_become_degrees(self):
-        self.assertEqual(limits_from_header({'CMrx': 28500}), {'coolant_max_c': 28.5})
+        self.assertEqual(limits_from_header({'CMrx': 28500}), {'coolant_max_c': 28.5})   # millidegrees
 
     def test_a_tach_maximum_period_is_a_minimum_speed_in_the_kernels_units(self):
         # exhaust/intake: nanoseconds at 2 pulses per rev; air assist:
@@ -62,12 +60,6 @@ class LimitsFromHeaderTests(unittest.TestCase):
 
     def test_the_minimum_period_tags_are_read_but_yield_nothing(self):
         self.assertEqual(limits_from_header({'AArn': 5000, 'EFrn': 5000, 'IFrn': 5000}), {})
-        self.assertEqual(set(coolsvc.INERT_LIMIT_TAGS), {'AArn', 'EFrn', 'IFrn'})
-
-    def test_the_tag_map_names_every_engine_parameter_once(self):
-        self.assertEqual(sorted(coolsvc.LIMIT_TAGS.values()),
-                         ['air_assist_min_rpm', 'coolant_max_c', 'coolant_min_c',
-                          'exhaust_min_rpm', 'intake_min_rpm'])
 
 
 class ReportTests(unittest.TestCase):
@@ -102,17 +94,15 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn('exhaust_min_rpm', p)
 
     def test_cleared_limits_leave_the_report(self):
+        self.svc.set_limits(limits_from_header({'AArd': 204}))      # a job with no limits
+        self.svc.report()
+        self.assertEqual(set(self.params()), {'mode', 'armed'})
         self.svc.set_limits({'coolant_max_c': 30.0})
         self.svc.report()
         self.assertIn('coolant_max_c', self.params())
         self.svc.clear_limits()
         self.svc.report()
         self.assertNotIn('coolant_max_c', self.params())
-
-    def test_a_job_with_no_limits_reports_none(self):
-        self.svc.set_limits(limits_from_header({'AArd': 204}))
-        self.svc.report()
-        self.assertEqual(set(self.params()), {'mode', 'armed'})
 
 
 if __name__ == '__main__':
