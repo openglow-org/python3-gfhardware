@@ -970,8 +970,12 @@ class JobLifecycleTests(unittest.TestCase):
                 self.assertAlmostEqual(sum(self.slept), want)
 
     def test_an_unhandled_header_key_is_a_gap(self):
+        # ZZzz has no applier and no recorded reason: a gap. A key with a
+        # recorded reason (DECLARED_IGNORED) has no applier either, and is
+        # not one.
+        declared = sorted(machine_mod.DECLARED_IGNORED)[0]
         header = {'STfr': 10000, 'AArd': 200, 'MCsn': 0, 'PDfm': 0,
-                  'ZZzz': 4242}
+                  declared: 1, 'ZZzz': 4242}
         self.assertEqual(self.m._log_header_gaps(header), ['ZZzz'])
 
     def test_applied_and_checked_keys_are_not_reported_as_gaps(self):
