@@ -676,10 +676,15 @@ class ButtonWaitTests(unittest.TestCase):
         self.assertFalse(COOL.armed)
 
     def test_interlock_open_cancels_the_wait(self):
+        # The loop's level ends the wait at once, not the wait's own bound.
+        self._short_timeout()
         SW.open_interlock(delay=0.05)
+        t0 = time.monotonic()
         self.m._button_wait({'id': 42})
+        dt = time.monotonic() - t0
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertLess(dt, 0.5, 'the wait ran to its bound (%.3f s)' % dt)
 
     def test_press_with_lid_open_does_not_arm(self):
         SW.word[InputSwitch.SW_DOORS] = False
@@ -727,11 +732,18 @@ class StartGateTests(unittest.TestCase):
         self.m = make_machine()
         SW.handler = self.m._switch_event
 
-    def test_lid_open_at_start_cancels_a_gated_job(self):
-        SW.word[InputSwitch.SW_DOORS] = False
-        self.m._motion({'id': 42, 'action_type': 'motion', 'motion_url': 'x'})
-        self.assertTrue(self.m._running_action_cancelled)
-        self.assertNotIn(('run', 1), CNC.writes)
+    def test_an_open_enclosure_at_start_cancels_a_gated_job(self):
+        # The lid (inactive = open) and the remote-interlock loop (active =
+        # open) refuse the start the same way: canceled, nothing started.
+        for code, val in ((InputSwitch.SW_DOORS, False), (InputSwitch.SW_INTERLOCK, True)):
+            with self.subTest(switch=code.name):
+                SW.__init__()
+                self.m = make_machine()
+                SW.word[code] = val
+                self.m._motion({'id': 42, 'action_type': 'motion', 'motion_url': 'x'})
+                self.assertTrue(self.m._running_action_cancelled)
+                self.assertNotIn(('run', 1), CNC.writes)
+                self.assertNotIn(('motor_lock', '0'), CNC.writes)
 
     def test_an_acknowledged_hunt_moves_nothing(self):
         # A GRBL homing session answers the service's hunt as done: no lens
