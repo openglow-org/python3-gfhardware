@@ -213,6 +213,12 @@ class VerdictFileTests(unittest.TestCase):
         # Never a resume while the engine still asks for the hold.
         self.write('{"ts_mono":%.3f,"fire_ok":true,"hold":true,"resume_ok":true}\n' % self.stamp())
         self.assertFalse(self.svc.resume_ok())
+        # A resume takes both keys: an absent hold still holds, and an
+        # absent resume_ok offers none.
+        self.write('{"ts_mono":%.3f,"fire_ok":true,"resume_ok":true}\n' % self.stamp())
+        self.assertFalse(self.svc.resume_ok())
+        self.write('{"ts_mono":%.3f,"fire_ok":true,"hold":false}\n' % self.stamp())
+        self.assertFalse(self.svc.resume_ok())
 
 
 if __name__ == '__main__':

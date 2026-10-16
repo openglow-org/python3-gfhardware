@@ -256,7 +256,8 @@ class FakeCooling:
     """The engine's verdict as the fake sees it: fire_ok, and a hold that
     follows it unless a test says otherwise (the engine never blocks fire
     without asking for a hold); resume_ok is the hold's complement. stale
-    stands for a missing or outdated verdict file.
+    stands for a missing or outdated verdict file, and absent names the
+    keys a document leaves out.
 
     The published armed flag is the engine's acknowledgment that it has
     taken the reported armed window and applied the run airflow, so it
@@ -270,6 +271,7 @@ class FakeCooling:
         self._fire_ok = True
         self._hold = None
         self.stale = False
+        self.absent = ()
         self.ack = True
         self.name = 'OK'
         self.fallbacks = 0
@@ -282,9 +284,12 @@ class FakeCooling:
         if self.stale:
             return None
         hold = (not self._fire_ok) if self._hold is None else self._hold
-        return {'fire_ok': self._fire_ok, 'hold': hold, 'resume_ok': not hold,
-                'armed': self.armed and self.ack,
-                'verdict': self.name, 'reason': ''}
+        v = {'fire_ok': self._fire_ok, 'hold': hold, 'resume_ok': not hold,
+             'armed': self.armed and self.ack,
+             'verdict': self.name, 'reason': ''}
+        for key in self.absent:
+            del v[key]
+        return v
 
     def hold(self):
         v = self.verdict()
@@ -1625,6 +1630,58 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertIn(('laser_latch', 0), w)
         self.assertIn(('resume', 1950), w)
 
+    def test_a_verdict_without_fire_ok_locks_the_latch(self):
+        # An absent fire_ok reads as false: the latch locks, though
+        # nothing in the document asks for a hold.
+        COOL.absent = ('fire_ok',)
+        CNC.run_reads = 5
+        self.m._run_loop(pausable=True)
+        self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertNotIn(('laser_latch', 0), CNC.writes)
+
+    @staticmethod
+    def _end_the_program():
+        # Every forward run from here ends on its next state read.
+        CNC.run_reads = 1
+        CNC._reads_left = 1
+
+    def test_a_hold_lifts_only_on_hold_false_and_resume_ok(self):
+        # An absent hold reads as a hold, and an absent resume_ok as no
+        # resume. With either key absent, the engine's release lifts
+        # nothing: the job pauses, stays held, and the bound cancels it.
+        resume = CNC.resume
+
+        def retrace_then_release(steps):
+            resume(steps)
+            if steps < 0:
+                COOL._hold = False                  # the engine lifts its hold
+        try:
+            for key in ('hold', 'resume_ok'):
+                with self.subTest(absent=key):
+                    CNC.__init__()
+                    CNC.resume = retrace_then_release
+                    COOL.__init__()
+                    COOL.armed = True
+                    COOL.absent = (key,)
+                    COOL._hold = True               # the engine holds the job
+                    self.m = make_machine()
+                    SW.handler = self.m._switch_event
+                    self.m._hold_max_s = lambda: 0.4
+                    # A job that never holds, or that resumes, ends here
+                    # instead of playing on for good.
+                    end = threading.Timer(2.0, self._end_the_program)
+                    end.start()
+                    try:
+                        aborted = self.m._run_loop(pausable=True)
+                    finally:
+                        end.cancel()
+                    self.assertTrue(aborted)
+                    self.assertTrue(self.m._running_action_cancelled)
+                    self.assertIn(('resume', -2000), CNC.writes)       # held and retraced
+                    self.assertNotIn(('resume', 1950), CNC.writes)     # never resumed
+        finally:
+            vars(CNC).pop('resume', None)
+
     def test_the_button_does_not_resume_under_a_hold(self):
         SW.press(delay=0.05)                         # pause
         threading.Timer(0.20, lambda: setattr(COOL, '_hold', True)).start()
@@ -1754,6 +1811,21 @@ class VerdictWaitTests(unittest.TestCase):
         self.m._verdict_wait()
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('laser_latch', 1), CNC.writes)
+
+    def test_a_verdict_without_hold_or_armed_does_not_start_the_run(self):
+        # An absent hold reads as a hold, and an absent armed as false.
+        # The rest of the document reads clean, and the wait still runs
+        # out its bound and cancels the job with the latch locked.
+        for key in ('hold', 'armed'):
+            with self.subTest(absent=key):
+                self.setUp()
+                self.m._hold_max_s = lambda: 0.2
+                COOL.armed = True
+                COOL.absent = (key,)
+                self.m._verdict_wait()
+                self.assertTrue(self.m._running_action_cancelled)
+                self.assertIn(('laser_latch', 1), CNC.writes)
+                self.assertFalse(COOL.armed)
 
 
 if __name__ == '__main__':
