@@ -3,8 +3,7 @@ pulse header's envelope tags become as /cool/state parameters, what a
 sentinel or an absurd value becomes (nothing), and that the limits ride
 every report while a job is loaded and leave with it. Also the engine's
 verdict file as the client reads it: the 2 s window on the monotonic
-clock, the fail-safe value of an absent key, and a missing or torn
-document.
+clock, and a missing or torn document.
 """
 import math
 import os
@@ -162,17 +161,13 @@ class VerdictFileTests(unittest.TestCase):
         v = self.svc.verdict()
         self.assertEqual((v['fire_ok'], v['hold'], v['resume_ok'], v['armed'], v['verdict']),
                          (True, False, True, True, 'OK'))
-        self.assertTrue(self.svc.fire_ok())
-        self.assertFalse(self.svc.hold())
-        self.assertTrue(self.svc.resume_ok())
 
     def test_a_blocking_verdict_holds(self):
         self.publish(fire_ok=False, verdict='WARMUP', hold=True,
                      reason='coolant 18.0 C under the 21.0 C start gate')
-        self.assertFalse(self.svc.fire_ok())
-        self.assertTrue(self.svc.hold())
-        self.assertFalse(self.svc.resume_ok())
-        self.assertEqual(self.svc.verdict()['verdict'], 'WARMUP')
+        v = self.svc.verdict()
+        self.assertEqual((v['fire_ok'], v['hold'], v['resume_ok'], v['verdict']),
+                         (False, True, False, 'WARMUP'))
 
     def test_the_window_is_two_seconds_on_the_monotonic_clock(self):
         self.publish(age_s=1.9)
@@ -180,9 +175,6 @@ class VerdictFileTests(unittest.TestCase):
         # A clean document past the window is no verdict: fire blocked, hold.
         self.publish(age_s=2.1)
         self.assertIsNone(self.svc.verdict())
-        self.assertFalse(self.svc.fire_ok())
-        self.assertTrue(self.svc.hold())
-        self.assertFalse(self.svc.resume_ok())
 
     def test_a_stamp_ahead_of_the_clock_is_no_verdict(self):
         # Future-dated, it would otherwise read as fresh for good.
@@ -190,11 +182,9 @@ class VerdictFileTests(unittest.TestCase):
             with self.subTest(ahead_s=ahead_s):
                 self.publish(age_s=-ahead_s)
                 self.assertIsNone(self.svc.verdict())
-                self.assertTrue(self.svc.hold())
 
-    def test_a_missing_torn_or_wrong_document_holds(self):
+    def test_a_missing_torn_or_wrong_document_is_no_verdict(self):
         self.assertIsNone(self.svc.verdict())           # no file
-        self.assertTrue(self.svc.hold())
         now = self.stamp()
         for body in ('{"seq":1,"ts_mono":%.3f,"fire_ok":true' % now,     # torn: no closing brace
                      '[]\n',                                              # not an object
@@ -203,22 +193,6 @@ class VerdictFileTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.write(body)
                 self.assertIsNone(self.svc.verdict())
-                self.assertTrue(self.svc.hold())
-
-    def test_an_absent_key_takes_the_fail_safe_value(self):
-        self.write('{"ts_mono":%.3f}\n' % self.stamp())
-        self.assertFalse(self.svc.fire_ok())
-        self.assertTrue(self.svc.hold())
-        self.assertFalse(self.svc.resume_ok())
-        # Never a resume while the engine still asks for the hold.
-        self.write('{"ts_mono":%.3f,"fire_ok":true,"hold":true,"resume_ok":true}\n' % self.stamp())
-        self.assertFalse(self.svc.resume_ok())
-        # A resume takes both keys: an absent hold still holds, and an
-        # absent resume_ok offers none.
-        self.write('{"ts_mono":%.3f,"fire_ok":true,"resume_ok":true}\n' % self.stamp())
-        self.assertFalse(self.svc.resume_ok())
-        self.write('{"ts_mono":%.3f,"fire_ok":true,"hold":false}\n' % self.stamp())
-        self.assertFalse(self.svc.resume_ok())
 
 
 if __name__ == '__main__':

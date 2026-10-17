@@ -278,7 +278,6 @@ class FakeCooling:
 
     def set_armed(self, a): self.armed = bool(a)
     def set_mode(self, m): self.mode = m
-    def fire_ok(self): return not self.stale and self._fire_ok
 
     def verdict(self):
         if self.stale:
@@ -290,14 +289,6 @@ class FakeCooling:
         for key in self.absent:
             del v[key]
         return v
-
-    def hold(self):
-        v = self.verdict()
-        return v is None or v['hold']
-
-    def resume_ok(self):
-        v = self.verdict()
-        return bool(v and v['resume_ok'])
 
     def fallback_airflow(self): self.fallbacks += 1
     def clear_profile(self): pass
@@ -1812,11 +1803,12 @@ class VerdictWaitTests(unittest.TestCase):
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('laser_latch', 1), CNC.writes)
 
-    def test_a_verdict_without_hold_or_armed_does_not_start_the_run(self):
-        # An absent hold reads as a hold, and an absent armed as false.
-        # The rest of the document reads clean, and the wait still runs
-        # out its bound and cancels the job with the latch locked.
-        for key in ('hold', 'armed'):
+    def test_a_verdict_without_hold_fire_ok_or_armed_does_not_start_the_run(self):
+        # An absent hold reads as a hold, and an absent fire_ok or armed
+        # as false. The rest of the document reads clean, and the wait
+        # still runs out its bound and cancels the job with the latch
+        # locked.
+        for key in ('hold', 'fire_ok', 'armed'):
             with self.subTest(absent=key):
                 self.setUp()
                 self.m._hold_max_s = lambda: 0.2

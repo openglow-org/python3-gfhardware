@@ -209,21 +209,6 @@ class CoolingService(Thread):
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def fire_ok(self) -> bool:
-        v = self.verdict()
-        return bool(v and v.get('fire_ok'))
-
-    def hold(self) -> bool:
-        """The engine asks for a hold. A missing or stale verdict holds."""
-        v = self.verdict()
-        return v is None or bool(v.get('hold', True))
-
-    def resume_ok(self) -> bool:
-        """The engine offers the resume from its hold. Never on a missing
-        or stale verdict, and never while it still asks for the hold."""
-        v = self.verdict()
-        return bool(v and v.get('resume_ok') and not v.get('hold', True))
-
     @staticmethod
     def fallback_airflow() -> None:
         """The run airflow, written directly: for a verdict gone stale
