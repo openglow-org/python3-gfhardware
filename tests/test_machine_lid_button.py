@@ -1578,7 +1578,8 @@ class VerdictHoldTests(unittest.TestCase):
                          ['print:paused', 'print:resumed'])
 
     def test_a_hold_with_fire_permitted_pauses_without_the_latch(self):
-        # SUSPECT: hold asked, fire still permitted. The pause, not the latch.
+        # A hold asked with fire still permitted, as the verdict file may
+        # say: the pause, not the latch.
         threading.Timer(0.05, lambda: setattr(COOL, '_hold', True)).start()
         threading.Timer(0.40, self._release).start()
         threading.Timer(0.70, lambda: setattr(CNC, '_reads_left', 1)).start()

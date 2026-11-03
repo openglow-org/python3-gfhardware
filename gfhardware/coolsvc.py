@@ -95,8 +95,7 @@ class CoolingService(Thread):
     https://docs.forgefirm.org/technical/forgefirm/cooling-engine/).
 
     The engine owns the thermal hardware - fan/pump/TEC/heater profiles,
-    coolant flow verification, over-temp policy - for every controller
-    mode. This client reports job state (mode, armed, and the per-job
+    over-temp policy - for every controller mode. This client reports job state (mode, armed, and the per-job
     run fan duties from the pulse header) level-triggered at ~1 Hz, and
     reads the engine's published verdict on the fire path, treating a
     missing or stale verdict file as fire-blocked.
