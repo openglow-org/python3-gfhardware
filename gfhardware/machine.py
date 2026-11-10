@@ -89,11 +89,29 @@ def _inherited_pulse_dev():
 
 
 # How long a print may be held on the cooling verdict (WARMUP, COLD, a
-# hot loop, a suspected flow fault) before it is canceled instead: the
+# hot loop, an unreadable coolant sensor) before it is canceled instead: the
 # engine offers no resume on its fail tiers, and a hold with no end is
 # not a state a job can be left in. The forgefirm.conf key
 # cloud_hold_max_s overrides it (60 to 7200 s).
 HOLD_MAX_DEFAULT_S = 1800.0
+# How long the cooling verdict may be missing, once the button wait has
+# handed back over it, before it is lost and the print canceled: the
+# engine publishes every second and a verdict is stale at 2 s, so this
+# covers a stall and not an engine that is gone.
+VERDICT_STALL_GRACE_S = 10.0
+# What the app says about a held print rides on the fault reported just ahead of
+# print:paused. A hold with no fault here reads as a plain pause in the app.
+HOLD_FAULTS = {
+    'OVERTEMP': 'coolant_recoverable_alert',
+    'BUMP': 'head_accel_x_alert',
+    'CRASH': 'head_accel_x_alert',
+    'FLAME': 'lid_ir_1st_quartile_alert',
+    'FIRE': 'lid_ir_1st_quartile_alert',
+    'CRITICAL': 'interior_temp_alert',
+}
+# An airflow hold's reason names the fan. intake_2 before the plain intake.
+AIRFLOW_FAULTS = (('exhaust', 'exhaust_fan_alert'), ('air_assist', 'air_assist_alert'),
+                  ('intake_2', 'intake_2_fan_alert'), ('intake', 'intake_1_fan_alert'))
 
 # The shared machine config: the same trivial "key = value" file the
 # GRBL controller and forgectrl read, so both controller modes honor
@@ -346,7 +364,15 @@ class Machine(BaseMachine):
         })
 
         self._button_pressed: bool = False
+        # A press taken with the laser latch unlocked, and no lock since:
+        # what every lit run start and lit resume needs (_latch_lock).
+        self._press_live: bool = False
+        # The arm's go-around (_arm_for_the_press): the button wait handed
+        # back over a closed verdict, and the arm's overall bound.
+        self._press_again: bool = False
+        self._arm_until = None
         self._motion_stats: dict = {}
+        self._fault_up = None       # the fault the service has heard is holding the print
         self._feeder = None
         self._captured = None
         # Set once the process is going down: a running action is told to
@@ -401,14 +427,121 @@ class Machine(BaseMachine):
             max_s = HOLD_MAX_DEFAULT_S
         return max_s
 
-    def _verdict_wait(self) -> None:
-        """Wait out a cooling hold before the run starts.
+    @staticmethod
+    def _hold_fault(v: dict):
+        """The fault the service hears for this verdict, or None."""
+        name = (v or {}).get('verdict')
+        if name == 'AIRFLOW':
+            reason = v.get('reason') or ''
+            for word, fault in AIRFLOW_FAULTS:
+                if word in reason:
+                    return fault
+            return None
+        return HOLD_FAULTS.get(name)
+
+    @staticmethod
+    def _ack_waits(v: dict) -> bool:
+        """Whether a fault waits for its Acknowledge on the control panel:
+        the verdict's ack_wait, which the engine sets whatever the verdict's
+        name, or the name ACK, which it takes only when no other verdict
+        stands. An absent ack_wait is false."""
+        return bool(v.get('ack_wait')) or v.get('verdict') == 'ACK'
+
+    def _fault_report(self, v: dict) -> None:
+        """Keep the one fault the service has heard on what holds the print."""
+        want = self._hold_fault(v)
+        if want == self._fault_up:
+            return
+        self._fault_clear()
+        if want:
+            send_wss_event(self._q_msg_tx, None, 'fault:%s:set' % want)
+            self._fault_up = want
+
+    def _lamp_keep(self, want: str) -> None:
+        """The lamp put back if something wrote over it (forgectrl's red
+        flash leaves the button dark when it ends), once a second, never over
+        the red itself."""
+        now = monotonic()
+        if now < getattr(self, '_lamp_next', 0.0):
+            return
+        self._lamp_next = now + 1.0
+        got = button_pattern()
+        if got in (None, 'red', want):
+            return
+        if want == 'breathe':
+            set_button_breathe()
+        else:
+            set_button_color(ButtonColor.WHITE if want == 'white' else ButtonColor.OFF)
+
+    def _fault_clear(self) -> None:
+        """A fault left set stays on the machine's record at the service."""
+        if self._fault_up:
+            send_wss_event(self._q_msg_tx, None, 'fault:%s:reset' % self._fault_up)
+            self._fault_up = None
+
+    def _latch_lock(self) -> None:
+        """Lock the laser latch. The lock also sets the hardware's own
+        button latch, which only a press taken with this lock released
+        clears, so every lock costs a new press: the press on record is
+        spent."""
+        self._press_live = False
+        cnc.laser_latch(1)
+
+    def _latch_unlock(self) -> None:
+        """Release the lock, for the press that comes next. A press from
+        before this moment does not count: the hardware ignored it."""
+        self._press_live = False
+        self._button_pressed = False
+        self._button_edges = 0
+        cnc.laser_latch(0)
+
+    @staticmethod
+    def _button_timeout_s() -> float:
+        """How long a press is waited for: the shared laser_button_timeout_s
+        (default 300 s, 1 to 3600; a value outside that falls back)."""
+        timeout_s = _conf_float('laser_button_timeout_s', 300.0)
+        if not 1.0 <= timeout_s <= 3600.0:
+            timeout_s = 300.0
+        return timeout_s
+
+    def _arm_for_the_press(self, msg: dict) -> None:
+        """A print's arm, from the open armed session to the press: the
+        cooling hold waited out with the latch locked, the latch unlocked,
+        the press asked for.
+
+        A verdict that stops permitting fire, or goes missing, while the
+        button is being waited for does not cancel the print: the operator
+        has done nothing yet. The button wait locks the latch, stops asking,
+        and hands back here; the verdict is waited on again (a missing one
+        for VERDICT_STALL_GRACE_S, then it is lost and the print canceled),
+        and the latch is unlocked and the press asked for anew. The whole of
+        it is bounded: from the first time the press is asked for, the
+        button's own timeout plus the hold's bound, whatever the number of
+        trips. The lid, the interlock loop, a cancel, a timeout and a
+        pending Acknowledge cancel as they do in either wait. Returns with
+        the press taken (latch unlocked) or the print canceled (locked).
+        """
+        self._arm_until = None
+        self._verdict_wait()
+        while not self._running_action_cancelled:
+            self._latch_unlock()
+            if self._arm_until is None:
+                self._arm_until = monotonic() + self._button_timeout_s() + self._hold_max_s()
+            self._press_again = False
+            self._button_wait(msg)
+            if self._running_action_cancelled or not self._press_again:
+                break
+            self._verdict_wait(until=self._arm_until, lost_grace_s=VERDICT_STALL_GRACE_S)
+        self._arm_until = None
+
+    def _verdict_wait(self, until: float = None, lost_grace_s: float = 0.0) -> None:
+        """Wait out a cooling hold before the press is asked for.
 
         The armed session is open, so the engine is working on whatever
         holds it (the warm-up heater, the loop cooling). The laser latch
         is still locked here: it unlocks only once this wait has passed,
-        immediately before the run starts, so a verdict that never
-        clears leaves it locked. Bounded by cloud_hold_max_s; the lid,
+        and the button is asked for only after that, so a verdict that
+        never clears leaves it locked. Bounded by cloud_hold_max_s; the lid,
         the interlock loop, a service cancel, and a verdict that goes
         missing end it the way they end the button wait: latch locked,
         disarmed, job canceled.
@@ -419,60 +552,96 @@ class Machine(BaseMachine):
         computed for the idle session before the arm, and at idle
         nothing is wrong - so it says fire is fine while the fans are
         still at their idle duty.
+
+        ``until`` ends the wait earlier than its own bound (the arm's
+        overall bound, _arm_for_the_press). ``lost_grace_s`` is how long a
+        verdict may be missing before it is lost: none on the first wait,
+        a few seconds when the button wait handed back over a stall.
         """
         max_s = self._hold_max_s()
         deadline = monotonic() + max_s
+        if until is not None and until < deadline:
+            deadline = until
         named = None
         abort = None
+        told = False
+        lost_since = None
         while True:
             v = cooling_svc.verdict()
-            if v is None:
+            if v is not None:
+                lost_since = None
+            elif lost_since is None:
+                lost_since = monotonic()
+            if v is None and monotonic() - lost_since >= lost_grace_s:
                 abort = 'cooling verdict lost'
-            elif (not v.get('hold', True) and v.get('fire_ok')
+            elif (v is not None and not v.get('hold', True) and v.get('fire_ok')
                     and v.get('armed')):
                 break
             elif self._running_action_cancelled:
                 abort = 'canceled'
+            elif v is not None and self._ack_waits(v):
+                abort = 'a fault waits for its Acknowledge on the control panel'
             else:
                 abort = self._enclosure_open(self._sw_thread.all_switches())
                 if abort is None and monotonic() > deadline:
-                    abort = 'held %.0f s' % max_s
+                    abort = 'held %.0f s' % max_s if until is None else 'held past the wait for the press'
             if abort is not None:
                 break
+            if v is None:
+                # Missing inside its grace: neither clean nor lost yet.
+                self._run_wake.wait(.1)
+                self._run_wake.clear()
+                continue
             if v.get('verdict') != named:
                 named = v.get('verdict')
                 logger.info('waiting on the cooling engine: %s (%s)',
                             named, v.get('reason') or 'no reason given')
+            # The app can say why, as it can mid-print.
+            self._fault_report(v)
+            if self._fault_up and not told:
+                told = True
+                send_wss_event(self._q_msg_tx, self.running_action_id, 'print:paused')
             self._run_wake.wait(.5)
             self._run_wake.clear()
+        self._fault_clear()
+        # Resumed only for a print that goes on: a canceled one is not.
+        if told and abort is None:
+            send_wss_event(self._q_msg_tx, self.running_action_id, 'print:resumed')
         if abort is not None:
             logger.warning('cooling hold %s - relocking the laser', abort)
-            cnc.laser_latch(1)
+            self._latch_lock()
             cooling_svc.set_armed(False)
             self._running_action_cancelled = True
             set_button_color(ButtonColor.OFF)
         elif named is not None:
-            logger.info('cooling verdict clean after %s; starting the run', named)
+            logger.info('cooling verdict clean after %s', named)
 
     def _button_wait(self, msg: dict) -> None:
-        # The wait runs with the armed session open and the latch still
-        # locked (the unlock comes right before the run, once the verdict
-        # has passed), and it is bounded and supervised the same way GRBL
-        # mode's arm window is: the shared laser_button_timeout_s
-        # (default 300 s, clamped to 1-3600 - out-of-range values fall
-        # back, never wait-forever) bounds it, and an opened lid or
-        # interlock loop ends it (the hardware button latch would ignore
-        # the press anyway). Timeout, lid, interlock, and cloud cancel all
-        # leave the latch locked and disarm before returning. Wakes on
-        # switch edges, so a press or a lid open is seen within
-        # milliseconds.
-        timeout_s = _conf_float('laser_button_timeout_s', 300.0)
-        if not 1.0 <= timeout_s <= 3600.0:
-            timeout_s = 300.0
-        deadline = monotonic() + timeout_s
+        # The wait runs with the armed session open, the cooling verdict
+        # passed and the latch unlocked by the caller: the hardware's own
+        # button latch is set by the lock and cleared only by a press taken
+        # with the lock released, so the press is asked for (the button
+        # breathes) only once it can count. It is bounded and supervised
+        # the same way GRBL mode's arm window is: the shared
+        # laser_button_timeout_s (default 300 s, clamped to 1-3600 -
+        # out-of-range values fall back, never wait-forever) bounds it, and
+        # an opened lid or interlock loop ends it. Timeout, lid, interlock
+        # and cloud cancel all lock the latch and disarm before returning.
+        # A verdict that stops permitting fire, or goes missing, ends the
+        # wait too, within one pass, so the latch is not left unlocked
+        # under a closed gate; but it does not end the print, which nobody
+        # has pressed for yet: the button stops asking, the latch is
+        # locked, and _press_again tells the caller to wait the verdict
+        # out and ask again (_arm_for_the_press, whose overall bound,
+        # _arm_until, also ends this wait). Wakes on switch edges, so a
+        # press or a lid open is seen within milliseconds.
+        deadline = monotonic() + self._button_timeout_s()
+        if self._arm_until is not None and self._arm_until < deadline:
+            deadline = self._arm_until
+        again = None
         self._button_pressed = False
         self._run_wake.clear()
-        set_button_color(ButtonColor.WHITE)
+        set_button_breathe()
         logger.info('waiting for button')
         abort = None
         # The press is delivered as an edge by the switch thread; the level
@@ -489,6 +658,13 @@ class Machine(BaseMachine):
             if reason is not None:
                 abort = reason
                 break
+            if monotonic() > deadline:
+                abort = 'timed out'
+                break
+            v = cooling_svc.verdict()
+            if v is None or not v.get('fire_ok'):
+                again = v.get('verdict') if v else 'no verdict'
+                break
             if self._button_pressed:
                 break
             level = switches.get(InputSwitch.SW_BUTTON)
@@ -498,17 +674,27 @@ class Machine(BaseMachine):
                 logger.warning('button press seen as a level, not an edge '
                                '(is the switch thread alive?)')
                 break
-            if monotonic() > deadline:
-                abort = 'timed out'
-                break
+            self._lamp_keep('breathe')
             self._run_wake.wait(.1)
             self._run_wake.clear()
+        # The press is taken (or the wait is over): the button stops asking.
+        set_button_color(ButtonColor.OFF)
         if abort is not None:
             logger.warning('button wait %s - relocking the laser', abort)
-            cnc.laser_latch(1)
+            self._latch_lock()
             cooling_svc.set_armed(False)
             self._running_action_cancelled = True
-            set_button_color(ButtonColor.OFF)
+        elif again is not None:
+            # The button dark first, then the lock: it never asks for a
+            # press that could not count. The armed session stays open.
+            logger.warning('the cooling verdict stopped permitting fire during the button '
+                           'wait (%s) - relocking the laser; the press is asked for again '
+                           'once it clears', again)
+            self._latch_lock()
+            self._press_again = True
+        else:
+            # Taken with the latch unlocked: the one press a fire may follow.
+            self._press_live = True
 
     @staticmethod
     def _config_from_pulse(state: str, header: dict):
@@ -592,7 +778,9 @@ class Machine(BaseMachine):
     def _action_cleanup(self) -> None:
         """Post-action failsafe hook (BaseMachine runs it even when an action
         crashes): stop motion, lock the laser latch, extinguish the head
-        emitters, and drop the pulse-device registration. The deadman fd
+        emitters, drop the pulse-device registration, and last put the
+        button out, so a wait or a run that ended in an exception does not
+        leave it breathing or white. The deadman fd
         itself is closed by _motion's with-block - when a crash happens
         mid-run, that close is what fires the kernel dead man's switch."""
         # cnc.stop() first: a crashed action must not leave the gantry
@@ -603,7 +791,7 @@ class Machine(BaseMachine):
         # never depend on the stop.
         self._safe_steps('cleanup', (
             ('stop motion', cnc.stop),
-            ('lock the laser latch', lambda: cnc.laser_latch(1)),
+            ('lock the laser latch', self._latch_lock),
             ('lock the lens out of the pulse path', lambda: cnc.set_motor_lock('8')),
             ('rest the lens driver at its hold current', lambda: ZAxis.set_current(ZCur.LOW)),
             ('turn the head emitters off', head_all_led_off),
@@ -613,7 +801,17 @@ class Machine(BaseMachine):
             ('disarm the cooling engine', lambda: cooling_svc.set_armed(False)),
             ('report idle to the cooling engine', lambda: cooling_svc.set_mode('idle')),
             ('clear the job limits', cooling_svc.clear_limits),
+            ('put the button out', self._lamp_off),
         ))
+
+    @staticmethod
+    def _lamp_off() -> None:
+        """The button dark, where the light on it is this client's: its
+        breathing white or its solid white, or a button that cannot be
+        read. forgectrl's red flash and its setup lights are not this
+        client's to put out."""
+        if button_pattern() in (None, 'breathe', 'white'):
+            set_button_color(ButtonColor.OFF)
 
     @staticmethod
     def _safe_steps(what: str, steps) -> None:
@@ -637,6 +835,10 @@ class Machine(BaseMachine):
         ZAxis.reset()
         set_button_color(ButtonColor.OFF)
         cnc.enable()
+        # A client stopped mid-hold (the fail tiers restart it) could not reset
+        # its fault, and the machine's record at the service would keep it.
+        for fault in sorted(set(HOLD_FAULTS.values()) | {f for _, f in AIRFLOW_FAULTS}):
+            send_wss_event(self._q_msg_tx, None, 'fault:%s:reset' % fault)
 
     def _lid_image(self, msg: dict, settings: dict = None) -> None:
         # The flash is the service's to ask for, per shot, and a lid image is
@@ -795,6 +997,7 @@ class Machine(BaseMachine):
         try:
             super().motion(msg)
         finally:
+            self._fault_clear()
             captured, self._captured = self._captured, None
             if captured is not None:
                 self._write_capture(*captured)
@@ -865,21 +1068,35 @@ class Machine(BaseMachine):
             send_wss_event(self._q_msg_tx, msg['id'], 'print:download:completed')
             # The cooling engine's verdict gates the armed window. An
             # absent engine (no verdict, or a stale one) blocks the print
-            # outright: nothing would warm the loop or verify flow. A
+            # outright: nothing would warm the loop or watch its limits. A
             # standing hold (the coolant under the floor, a hot loop) is
-            # waited out after the button instead, once the armed session
-            # is open and the engine is working on it.
-            if cooling_svc.verdict() is None:
+            # waited out before the button is asked for, once the armed
+            # session is open and the engine is working on it.
+            v0 = cooling_svc.verdict()
+            if v0 is None:
                 logger.error('no cooling verdict; the print cannot arm')
                 self._running_action_cancelled = True
+            elif self._ack_waits(v0):
+                # Not asked for a press the print would then be canceled
+                # after: a fault waits for its Acknowledge on the panel,
+                # under the name ACK or under another verdict's.
+                logger.error('a fault waits for its Acknowledge on the control panel; the print cannot arm')
+                self._running_action_cancelled = True
             else:
-                # The latch stays locked through the button wait, the
-                # warm-up and the verdict wait: it unlocks once the
-                # verdict has passed, right before the run. A fire_ok
-                # false verdict at any point before the run therefore
-                # never finds the latch open.
+                # The armed session opens and the cooling hold is waited
+                # out with the latch still locked. Only then is the latch
+                # unlocked and the press asked for: the lock sets the
+                # hardware's own button latch, and only a press taken
+                # with the lock released clears it. The press is the
+                # operator's last act before fire. From the unlock to the
+                # run, the lid, the interlock loop, a timeout or a cancel
+                # locks the latch again, disarms and cancels the print. A
+                # verdict that stops permitting fire locks it too: before
+                # the press the verdict is waited out and the press asked
+                # for again (_arm_for_the_press); after it, in the warm-up
+                # or at the run's start, the print is canceled.
                 cooling_svc.set_armed(True)
-                self._button_wait(msg)
+                self._arm_for_the_press(msg)
             if not self._running_action_cancelled:
                 send_wss_event(self._q_msg_tx, msg['id'], 'print:warmup:starting')
 
@@ -889,12 +1106,6 @@ class Machine(BaseMachine):
             cooling_svc.set_mode('run')
             if msg['action_type'] == 'print':
                 self._dwell('warm_up')
-
-        # A print starts only on a clean verdict: a session that opened
-        # under the warm-up gate or the floor is held here, with the
-        # engine warming the loop, until it releases.
-        if not self._running_action_cancelled and msg['action_type'] == 'print':
-            self._verdict_wait()
 
         # Run motion job. Only a print pauses on the button (the factory's
         # print handler is the one that acts on the press); a motion or a
@@ -914,6 +1125,7 @@ class Machine(BaseMachine):
                     logger.error('cannot declare the live feed (%s); canceling '
                                  'the job before it starts', e)
                     self._running_action_cancelled = True
+                    self._latch_lock()
                     cooling_svc.set_armed(False)
         if not self._running_action_cancelled:
             progress = None
@@ -927,7 +1139,7 @@ class Machine(BaseMachine):
             aborted = self._run_loop(lid_gated=lid_gated,
                                      pausable=msg['action_type'] == 'print',
                                      progress=progress,
-                                     unlock_latch=msg['action_type'] == 'print')
+                                     lit=msg['action_type'] == 'print')
             if not aborted and not self._running_action_cancelled and not self._feeder.finished:
                 # The kernel went idle with part of the job still in the
                 # feeder's hands: a live feed the device did not take as
@@ -956,7 +1168,7 @@ class Machine(BaseMachine):
             # The job's feed is over. The park that may follow writes its own
             # small program and must not inherit this one's state.
             self._feeder = None
-            cnc.laser_latch(1)
+            self._latch_lock()
             cooling_svc.set_armed(False)
             pos = cnc.position
             expected = self._motion_stats['stats'] or {}
@@ -1037,10 +1249,11 @@ class Machine(BaseMachine):
         before the factory's own timings were measured.
 
         The wait is taken in short slices. The warm-up sits between the
-        button and the run with the armed session open, so it samples the
-        lid, the interlock loop and a service cancel between slices and
-        ends the job on any of them the way the waits around it do:
-        latch locked, disarmed, canceled. The cool-down follows a
+        button and the run with the armed session open and the latch
+        unlocked, so it samples the lid, the interlock loop, a service
+        cancel and the cooling verdict between slices and ends the job on
+        any of them the way the waits around it do: latch locked,
+        disarmed, canceled. The cool-down follows a
         finished job and is not supervised.
         """
         keys = {'warm_up': ('MOTION.WARM_UP_DELAY', WARM_UP_DEFAULT_S),
@@ -1069,9 +1282,16 @@ class Machine(BaseMachine):
                     abort = 'canceled'
                 else:
                     abort = self._enclosure_open(self._sw_thread.all_switches())
+                if abort is None:
+                    # The latch is unlocked here, the press taken: a verdict
+                    # that stops permitting fire ends the job as the lid does.
+                    v = cooling_svc.verdict()
+                    if v is None or not v.get('fire_ok'):
+                        abort = 'ended by the cooling verdict (%s)' % (
+                            v.get('verdict') if v else 'no verdict')
                 if abort is not None:
                     logger.warning('warm up %s - the job does not start', abort)
-                    cnc.laser_latch(1)
+                    self._latch_lock()
                     cooling_svc.set_armed(False)
                     self._running_action_cancelled = True
                     set_button_color(ButtonColor.OFF)
@@ -1179,22 +1399,27 @@ class Machine(BaseMachine):
 
     def _run_loop(self, park: bool = False, lid_gated: bool = True,
                   pausable: bool = False, progress: '_JobProgress' = None,
-                  unlock_latch: bool = False) -> bool:
+                  lit: bool = False) -> bool:
         """Play the loaded program. Returns True if the run was aborted
         (stopped before the program's end), False if it ran to completion.
 
-        ``unlock_latch`` is a print's: the laser latch is unlocked
-        immediately before the run starts, and nowhere earlier. Every
-        wait before this point (the button, the warm-up, the verdict)
-        runs with the latch locked, so a verdict that refuses fire before
-        the run never has to relock anything. The caller relocks when the
-        job ends. A motion, a hunt or a park never unlocks.
+        ``lit`` is a print's: the run may fire. The latch was unlocked
+        before the button wait and the press taken with it unlocked
+        (_feed_and_run); the run starts only with that press still good
+        (no lock since) and a verdict that permits fire, and is canceled
+        with the latch locked otherwise. Every lock sets the hardware's own
+        button latch, which only a press taken with the lock released
+        clears, so every lit resume after a lock is: unlock, the button
+        breathing, a new press. The latch is locked again when the run
+        ends. A motion, a hunt or a park never unlocks.
 
         Reactions during the run - the factory's, both modes alike:
           - lid or interlock loop opens: controlled stop, job canceled
             (a print then parks; the park itself ignores the lid);
           - service cancel: the same stop;
-          - cooling verdict pulled: latch relocked, the same stop;
+          - cooling verdict pulled: latch relocked, the same stop; once
+            the verdict permits fire again the latch is unlocked and the
+            job waits for a press, as a print paused on the button does;
           - button press (prints only): pause - stop, backtrack
             cloud_pause_backtrack_ticks with the laser off, hold; the
             next press resumes - forward, with the laser re-enabled
@@ -1220,12 +1445,25 @@ class Machine(BaseMachine):
         _ring_room_reset()
         logger.info('starting run')
         logger.info('current state: %s' % cnc.state)
+        if lit:
+            # The last look before fire: the press taken with the latch
+            # unlocked and nothing locked since, and a verdict that permits
+            # fire now. Otherwise the run does not start.
+            v = cooling_svc.verdict()
+            if not self._press_live or v is None or not v.get('fire_ok'):
+                logger.error('the run does not start: %s - relocking the laser',
+                             'no press was taken with the laser unlocked' if not self._press_live
+                             else 'the cooling verdict does not permit fire (%s)' % (
+                                 v.get('verdict') if v else 'no verdict'))
+                self._latch_lock()
+                cooling_svc.set_armed(False)
+                self._running_action_cancelled = True
+                set_button_color(ButtonColor.OFF)
+                return True
         set_button_color(ButtonColor.WHITE)
         self._button_edges = 0
         self._enclosure_edge = False
         self._run_wake.clear()
-        if unlock_latch:
-            cnc.laser_latch(0)
         cnc.run()
         # Wait for state transition
         wait_time = 20
@@ -1244,6 +1482,7 @@ class Machine(BaseMachine):
         retraced = 0
         aborted = False
         paused = False
+        lamp_now = 'white'
         # Feed watchdog state: the last progress seen from the feeder and
         # when, whether the job is being held for it, and how many times it
         # has had to be.
@@ -1258,6 +1497,13 @@ class Machine(BaseMachine):
         verdict_latched = False
         hold_deadline = 0.0
         hold_max_s = self._hold_max_s()
+        # A held job whose press was spent by a lock: the latch unlocked
+        # again, the button breathing, waiting for the press that lets it
+        # resume lit. It waits as a print paused on the button waits, with
+        # no clock of its own: the lid, the interlock loop, a cancel or a
+        # press ends it, and a verdict that closes again takes it back to
+        # the hold and the hold's bound.
+        rearm = False
         if progress is not None:
             progress.send(force=True)
         while True:
@@ -1269,6 +1515,21 @@ class Machine(BaseMachine):
             v_fire_ok = bool(v and v.get('fire_ok'))
             v_hold = armed and (v is None or bool(v.get('hold', True)))
             v_resume = bool(v and v.get('resume_ok') and not v.get('hold', True))
+            # The button says what the job is doing: solid white while it
+            # moves, breathing while a press would resume it, dark while
+            # the engine or the feed holds it (a press under a cooling hold
+            # does not resume). It never breathes with the latch locked: a
+            # press taken then would not count.
+            lamp = ('breathe' if rearm or (paused and not v_hold and not verdict_latched)
+                    else 'off' if paused or verdict_held or feed_held else 'white')
+            if lamp != lamp_now:
+                lamp_now = lamp
+                if lamp == 'breathe':
+                    set_button_breathe()
+                else:
+                    set_button_color(ButtonColor.OFF if lamp == 'off' else ButtonColor.WHITE)
+            else:
+                self._lamp_keep(lamp)
             if state is MachineState.UNDERRUN:
                 # A live-fed ring went dry mid-run. The stop was instant, so
                 # steps were skipped at speed: the position is not to be
@@ -1314,15 +1575,18 @@ class Machine(BaseMachine):
             # The cooling verdict (the cooling-engine contract, the same
             # as the GRBL controller's). fire_ok gates the beam and acts
             # at once: the latch. hold pauses the job the way the button
-            # does (stop, retrace, hold) and resume_ok picks it back up
-            # with the latch back; a hold that outlasts its bound cancels
-            # the job. A verdict gone missing is the engine gone with the
-            # laser hot: fire blocked and held, the check heater off, and
-            # the run airflow written once by this process, as nobody
-            # else will now.
+            # does (stop, retrace, hold) and resume_ok picks it back up; a
+            # hold that outlasts its bound cancels the job. A hold that
+            # locked the latch spent the press (the lock sets the hardware's
+            # own button latch): its resume is the latch unlocked, the
+            # button breathing, and a new press, waited for as a print
+            # paused on the button waits. A verdict gone missing is the engine gone
+            # with the laser hot: fire blocked and held, the loop heater
+            # off, and the run airflow written once by this process, as
+            # nobody else will now.
             if armed and not v_fire_ok and not verdict_latched:
                 verdict_latched = True
-                cnc.laser_latch(1)
+                self._latch_lock()
                 if v is None:
                     logger.error('cooling verdict lost mid-run; fire blocked, holding')
                     WaterPump.heater_off()
@@ -1330,11 +1594,39 @@ class Machine(BaseMachine):
                 else:
                     logger.error('cooling verdict pulled fire mid-run: %s (%s)',
                                  v.get('verdict'), v.get('reason') or 'no reason given')
+            # A print paused on the button whose latch was locked under it
+            # gets the lock released once the verdict permits fire again:
+            # the button breathes only from then, and the press that
+            # resumes it is taken with the latch unlocked.
+            if lit and paused and verdict_latched and v_resume and v_fire_ok:
+                verdict_latched = False
+                self._latch_unlock()
             if verdict_held:
-                if v_resume and v_fire_ok:
-                    if verdict_latched:
-                        cnc.laser_latch(0)
-                        verdict_latched = False
+                if pausable and v:
+                    self._fault_report(v)
+                clean = v_resume and v_fire_ok
+                if rearm and not clean:
+                    # The verdict closed again before the press (the block
+                    # above has locked the latch if it refuses fire).
+                    rearm = False
+                    hold_deadline = monotonic() + hold_max_s
+                    logger.info('the cooling verdict closed again before the press; holding')
+                go = clean and not (lit and not self._press_live)
+                if clean and not go:
+                    if not rearm:
+                        if verdict_latched:
+                            verdict_latched = False
+                            self._latch_unlock()
+                        self._button_edges = 0
+                        rearm = True
+                        logger.info('cooling verdict clean; the laser is unlocked and '
+                                    'the job waits for the button')
+                    elif self._button_edges:
+                        self._button_edges = 0
+                        self._press_live = True
+                        go = True
+                if go:
+                    rearm = False
                     logger.info('cooling verdict clean; resuming')
                     if not self._resume_retraced(retraced, overlap):
                         self._running_action_cancelled = True
@@ -1342,13 +1634,14 @@ class Machine(BaseMachine):
                         break
                     verdict_held = False
                     if pausable:
+                        self._fault_clear()
                         send_wss_event(self._q_msg_tx, self.running_action_id,
                                        'print:resumed')
                     if progress is not None:
                         progress.send(force=True)
                     sleep(.05)
                     continue
-                if monotonic() > hold_deadline:
+                if not rearm and monotonic() > hold_deadline:
                     logger.error('held on the cooling verdict for %.0f s (%s); '
                                  'canceling the job', hold_max_s,
                                  v.get('verdict') if v else 'no verdict')
@@ -1370,6 +1663,7 @@ class Machine(BaseMachine):
                 verdict_held = True
                 hold_deadline = monotonic() + hold_max_s
                 if pausable:
+                    self._fault_report(v)
                     send_wss_event(self._q_msg_tx, self.running_action_id,
                                    'print:paused')
                 if progress is not None:
@@ -1385,11 +1679,13 @@ class Machine(BaseMachine):
                 if moved:
                     feed_mark, feed_at = self._feeder.written, now
                 if feed_held:
-                    if moved and v_hold:
-                        # The feed is back but the engine holds: the same
-                        # hold, now the verdict's, resumed on its terms.
+                    if moved and (v_hold or (lit and not self._press_live)):
+                        # The feed is back but the engine holds, or the
+                        # latch was locked under the feed's hold and the
+                        # press is spent: the same hold, now the verdict's,
+                        # resumed on its terms.
                         logger.info('the pulse feed moved again, but the cooling '
-                                    'verdict holds (%s); staying held',
+                                    'verdict holds or held (%s); staying held',
                                     v.get('verdict') if v else 'no verdict')
                         feed_held = False
                         verdict_held = True
@@ -1398,9 +1694,6 @@ class Machine(BaseMachine):
                     if moved:
                         logger.info('the pulse feed moved again after %d bytes; '
                                     'resuming the job', self._feeder.written)
-                        if verdict_latched and v_fire_ok:
-                            cnc.laser_latch(0)
-                            verdict_latched = False
                         if not self._resume_retraced(retraced, overlap):
                             self._running_action_cancelled = True
                             aborted = True
@@ -1457,11 +1750,11 @@ class Machine(BaseMachine):
             # A press while the job is held for the feed is not lost: it is
             # left to be read once the job is moving again, where pausing is
             # a thing the machine can actually do.
-            if pausable and self._button_edges and verdict_held:
+            if pausable and self._button_edges and verdict_held and not rearm:
                 self._button_edges = 0
                 logger.info('button pressed while held on the cooling verdict; '
                             'staying held')
-            if pausable and self._button_edges and not feed_held:
+            if pausable and self._button_edges and not feed_held and not rearm:
                 self._button_edges = 0
                 if paused and v_hold:
                     logger.info('button pressed while paused, but the cooling '
@@ -1471,11 +1764,15 @@ class Machine(BaseMachine):
                     verdict_held = True
                     hold_deadline = monotonic() + hold_max_s
                     continue
+                if paused and lit and verdict_latched:
+                    # Taken with the latch locked: the hardware ignored it.
+                    logger.info('button pressed while paused, but the laser is '
+                                'locked on the cooling verdict; staying paused')
+                    continue
                 if paused:
                     logger.info('button pressed while paused')
-                    if verdict_latched and v_fire_ok:
-                        cnc.laser_latch(0)
-                        verdict_latched = False
+                    if lit:
+                        self._press_live = True     # taken with the latch unlocked
                     if not self._resume_retraced(retraced, overlap):
                         self._running_action_cancelled = True
                         aborted = True
@@ -1511,6 +1808,9 @@ class Machine(BaseMachine):
                 break                       # the kernel faulted while held
             self._run_wake.wait(.1)
             self._run_wake.clear()
+        if lit:
+            # However the run ended, the latch is locked here, at once.
+            self._latch_lock()
         end_state = cnc.state
         logger.info('current state: %s' % end_state)
         if not aborted and end_state is not MachineState.IDLE:
@@ -1536,6 +1836,7 @@ class Machine(BaseMachine):
                 self._running_action_cancelled = True
                 aborted = True
         set_button_color(ButtonColor.OFF)
+        self._fault_clear()
         if progress is not None:
             # Where the job actually ended, whether that is the end of the
             # program or wherever it was stopped.
@@ -1584,7 +1885,7 @@ class Machine(BaseMachine):
         self._run_wake.set()
         self._safe_steps('shutdown', (
             ('stop motion', cnc.stop),
-            ('lock the laser latch', lambda: cnc.laser_latch(1)),
+            ('lock the laser latch', self._latch_lock),
         ))
         thread = getattr(self, '_action_thread', None)
         if thread is not None and thread.is_alive():
@@ -1593,7 +1894,7 @@ class Machine(BaseMachine):
             if thread.is_alive():
                 logger.error('the running action did not stop')
         self._safe_steps('shutdown', (
-            ('lock the laser latch', lambda: cnc.laser_latch(1)),
+            ('lock the laser latch', self._latch_lock),
             ('disarm the cooling engine', lambda: cooling_svc.set_armed(False)),
             ('report idle to the cooling engine', lambda: cooling_svc.set_mode('idle')),
             ('clear the job limits', cooling_svc.clear_limits),
