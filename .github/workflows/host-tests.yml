@@ -14,6 +14,9 @@ permissions:
 jobs:
   unittest:
     runs-on: ubuntu-latest
+    # The whole job takes about a minute; a case left hanging fails here,
+    # not at the six-hour default.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:

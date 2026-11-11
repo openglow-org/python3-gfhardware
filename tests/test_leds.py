@@ -12,12 +12,15 @@ over forgectrl's red flash and from rewriting a lamp that already shows
 what it set, so each word it returns is a rule:
 
   - dark is 'off'
-  - breathing white, as set_button_breathe writes it, is 'breathe'
+  - breathing white, as set_button_breathe writes it, is 'breathe', and
+    still 'breathe' at its trough, where the targets have swung to 0
   - solid white, as set_button_color writes it, is 'white', and still
     'white' once the LED trigger has settled its 255 and reads it back 254
   - forgectrl's red flash (red pulsing, green and blue dark) is 'red', and
     a red with another channel lit under it is not
   - a button that cannot be read is None
+
+A color set over a breathe stops the pulse, so it reads as that color.
 
 Run:  python3 -m unittest tests.test_leds
 """
@@ -69,6 +72,17 @@ class ButtonPatternTests(unittest.TestCase):
     def test_breathing_white_is_breathe(self):
         leds.set_button_breathe()
         self.assertEqual(leds.button_pattern(), 'breathe')
+        # At the trough every target has swung to 0: still a breathe, not
+        # forgectrl's red flash.
+        self.lamp((0, 0, 0), (1800, 1800, 1800))
+        self.assertEqual(leds.button_pattern(), 'breathe')
+
+    def test_a_color_set_over_a_breathe_stops_the_pulse(self):
+        # The LED trigger keeps a pulse going under a new target: the dark
+        # that ends the button wait has to stop the breathing.
+        leds.set_button_breathe()
+        leds.set_button_color(ButtonColor.OFF)
+        self.assertEqual(leds.button_pattern(), 'off')
 
     def test_solid_white_is_white_as_written_and_as_it_reads_back_settled(self):
         leds.set_button_color(ButtonColor.WHITE)

@@ -11,10 +11,14 @@ button, and a service cancel, and what it reports about itself while it
 runs. The real Machine code runs against a fake kernel wrapper (records
 every cnc write, plays a simple state machine) and a fake switch monitor
 (settable switch word, edge delivery on the switch thread), with the wire
-events captured.
+events captured. Where a case measures a bound or would otherwise wait
+out a hold, it runs on machine time (MachineClock): nothing sleeps, and a
+job that never ends fails at the clock's horizon instead of hanging.
 
 Run:  PYTHONPATH=.:../Glowforge-Utilities python3 -m unittest tests.test_machine_lid_button
 """
+import heapq
+import itertools
 import json
 import importlib.util
 import os
@@ -289,10 +293,11 @@ class FakeCooling:
 
     ack_wait is the engine's own field for a fault that waits for its
     Acknowledge, whatever the verdict's name; None leaves the key out of
-    the document."""
+    the document. arms records every armed state reported, in order."""
 
     def __init__(self):
         self.armed = False
+        self.arms = []
         self.mode = 'idle'
         self._fire_ok = True
         self._hold = None
@@ -304,7 +309,10 @@ class FakeCooling:
         self.reason = ''
         self.fallbacks = 0
 
-    def set_armed(self, a): self.armed = bool(a)
+    def set_armed(self, a):
+        self.armed = bool(a)
+        self.arms.append(self.armed)
+
     def set_mode(self, m): self.mode = m
 
     def verdict(self):
@@ -463,6 +471,77 @@ def make_machine():
     m.running_action_id = 42
     m._running_action_cancelled = False
     return m
+
+
+_MONOTONIC, _SLEEP = machine_mod.monotonic, machine_mod.sleep
+
+
+class MachineClock:
+    """Machine time for one case. The machine module's monotonic() and
+    sleep() and the machine's run-loop wake read it, and what the case
+    schedules (a press, a verdict change, a sample) runs on the machine's
+    own thread when its time comes round, inside the wait or the sleep that
+    spans it, as an edge from the switch thread would. Nothing really
+    sleeps, so a case costs only its passes, and a bound is read to the
+    pass. A job that would go on for good (a hold never lifted, a run that
+    never ends) fails at the horizon instead of hanging."""
+
+    START = 1000.0      # well past zero, as a real monotonic clock reads
+
+    def __init__(self, case, machine, horizon=30.0):
+        self.now = self.START
+        self._horizon = self.START + horizon
+        self._due = []
+        self._order = itertools.count()
+        case.addCleanup(setattr, machine_mod, 'monotonic', _MONOTONIC)
+        case.addCleanup(setattr, machine_mod, 'sleep', _SLEEP)
+        machine_mod.monotonic = lambda: self.now
+        machine_mod.sleep = lambda s: self.run_to(self.now + s)
+        machine._run_wake = _MachineWake(self)
+
+    @property
+    def elapsed(self):
+        return self.now - self.START
+
+    def at(self, t, fn):
+        """Run fn at t seconds of machine time."""
+        heapq.heappush(self._due, (self.START + t, next(self._order), fn))
+
+    def press(self, t):
+        self.at(t, lambda: (SW._edge(InputSwitch.SW_BUTTON, True),
+                            SW._edge(InputSwitch.SW_BUTTON, False)))
+
+    def run_to(self, until, wake=None):
+        """Advance to until, running what falls due; a wake set on the way
+        ends the wait there."""
+        while self._due and self._due[0][0] <= until:
+            at, _, fn = heapq.heappop(self._due)
+            self.now = max(self.now, at)
+            fn()
+            if wake is not None and wake.flag:
+                return True
+        self.now = max(self.now, until)
+        if self.now > self._horizon:
+            raise AssertionError('the job was still going after %.0f s of machine time'
+                                 % self.elapsed)
+        return wake is not None and wake.flag
+
+
+class _MachineWake:
+    """The run loop's wake (a threading.Event) on machine time."""
+
+    def __init__(self, clock):
+        self._clock = clock
+        self.flag = False
+
+    def set(self): self.flag = True
+    def clear(self): self.flag = False
+    def is_set(self): return self.flag
+
+    def wait(self, timeout):
+        if self.flag:
+            return True
+        return self._clock.run_to(self._clock.now + timeout, self)
 
 
 class RunLoopTests(unittest.TestCase):
@@ -718,6 +797,18 @@ class ButtonWaitTests(unittest.TestCase):
         self.m._button_wait({'id': 42})
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertFalse(COOL.armed)
+
+    def test_a_service_cancel_ends_the_wait_with_the_latch_locked(self):
+        # The caller has unlocked the latch for the press; the service
+        # cancels at 0.1, and the wait ends at its next pass, not at its
+        # timeout, locked and disarmed.
+        clock = MachineClock(self, self.m)
+        CNC.latch = 0
+        clock.at(0.1, lambda: setattr(self.m, '_running_action_cancelled', True))
+        self.m._button_wait({'id': 42})
+        self.assertLess(clock.elapsed, 0.25)
+        self.assertEqual(CNC.latch, 1)
         self.assertFalse(COOL.armed)
 
     def test_interlock_open_cancels_the_wait(self):
@@ -1315,14 +1406,14 @@ class FeederExitTests(unittest.TestCase):
         self.m._motion_locked(self._print(), None)
         self.assertEqual(seen, [], "no press is asked for")
         self.assertTrue(self.m._running_action_cancelled)
-        self.assertFalse(COOL.armed)
+        self.assertNotIn(True, COOL.arms, 'no armed session opened')
         self.assertNotIn(('laser_latch', 0), CNC.writes)
 
     def test_an_acknowledge_waiting_under_another_verdict_refuses_the_print_before_the_button(self):
         # A critical fault ended the last job and the loop is still hot: the
         # verdict's name is OVERTEMP, and only ack_wait says an Acknowledge
-        # is pending. The print is refused before a press is asked for, with
-        # the Acknowledge words, not after the hold has been waited out.
+        # is pending. The print is refused before the armed session opens,
+        # not after the hold has been waited out.
         CNC.xy_steps = (0, 0)
         COOL._fire_ok = False
         COOL.name = 'OVERTEMP'
@@ -1333,12 +1424,10 @@ class FeederExitTests(unittest.TestCase):
             seen.append('asked')
             self.m._running_action_cancelled = True     # a press asked for ends the test here
         self.m._button_wait = press
-        with self.assertLogs(machine_mod.logger, 'ERROR') as logs:
-            self.m._motion_locked(self._print(), None)
+        self.m._motion_locked(self._print(), None)
         self.assertEqual(seen, [], "no press is asked for")
-        self.assertTrue(any('waits for its Acknowledge on the control panel' in line for line in logs.output))
         self.assertTrue(self.m._running_action_cancelled)
-        self.assertFalse(COOL.armed)
+        self.assertNotIn(True, COOL.arms, 'no armed session opened')
         self.assertNotIn(('laser_latch', 0), CNC.writes)
 
     def test_a_hold_with_no_acknowledge_waiting_still_asks_for_the_press(self):
@@ -1469,6 +1558,11 @@ class FeederExitTests(unittest.TestCase):
         self.assertFalse(COOL.armed)
 
     def test_an_acknowledge_that_comes_due_during_the_button_wait_cancels(self):
+        # The arm's bound is 3 s here (1 s for the button, 2 s for a hold),
+        # so a wait that sat the Acknowledge out would end in seconds, not
+        # in the default 35 minutes.
+        self.m._button_timeout_s = lambda: 1.0
+        self.m._hold_max_s = lambda: 2.0
         CNC.xy_steps = (0, 0)
         timer = threading.Timer(0.2, lambda: (setattr(COOL, '_fire_ok', False), setattr(COOL, 'name', 'ACK')))
         timer.start()
@@ -1510,6 +1604,33 @@ class FeederExitTests(unittest.TestCase):
         self.assertNotIn(('run', 1), CNC.writes)
         self.assertEqual(CNC.latch, 1)
         self.assertFalse(COOL.armed)
+
+    def test_each_wait_ends_at_the_arms_bound(self):
+        # The button waits 1 s and a hold 0.65 s, so the arm ends 1.65 s
+        # after the press is first asked for, at 0, whichever wait it is in.
+        # Each row closes the verdict during a button wait so that the wait
+        # that follows would run past that bound on its own clock:
+        #  - the button wait: closed at 0.8, open again at 1.2; the second
+        #    button wait starts at 1.3, and its own timeout is 2.3;
+        #  - the verdict wait: closed at 0.3, open at 0.5, closed again at
+        #    1.2 and left closed; that verdict wait's own bound is 1.85.
+        rows = (('the button wait', ((0.8, False), (1.2, True))),
+                ('the verdict wait', ((0.3, False), (0.5, True), (1.2, False))))
+        for name, fire_ok in rows:
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                self.m._button_timeout_s = lambda: 1.0
+                self.m._hold_max_s = lambda: 0.65
+                clock = MachineClock(self, self.m)
+                for at, ok in fire_ok:
+                    clock.at(at, lambda ok=ok: setattr(COOL, '_fire_ok', ok))
+                COOL.set_armed(True)
+                self.m._arm_for_the_press(self._print())
+                self.assertLess(clock.elapsed, 1.65 + 0.3, 'the arm outlived its bound')
+                self.assertTrue(self.m._running_action_cancelled)
+                self.assertEqual(CNC.latch, 1)
+                self.assertFalse(COOL.armed)
 
     def test_the_press_is_taken_with_the_latch_unlocked_and_the_run_starts_on_it(self):
         self.feed_completes = True
@@ -1562,27 +1683,30 @@ class FeederExitTests(unittest.TestCase):
         self.assertFalse(self.m._running_action_cancelled)
         self.assertEqual(CNC.starts, [('run', 0, 0)])
 
-    def test_a_verdict_that_closes_during_the_warm_up_relocks_and_cancels(self):
-        machine_mod.sleep = self._sleep                  # a real warm-up
+    def test_a_verdict_that_closes_or_goes_missing_during_the_warm_up_relocks_and_cancels(self):
+        # A 3 s warm-up on machine time, the press at 0.05; at 0.35 the
+        # verdict refuses fire, or goes missing. The job ends within the
+        # warm-up's slice.
         set_cfg('MOTION.WARM_UP_DELAY', '3')
         set_cfg('MOTION.COOL_DOWN_DELAY', '0')
-        try:
-            CNC.xy_steps = (0, 0)
-            SW.press(delay=0.05)
-            timer = threading.Timer(0.35, lambda: (setattr(COOL, '_fire_ok', False), setattr(COOL, 'name', 'SENSOR')))
-            timer.start()
-            self.addCleanup(timer.cancel)
-            t0 = time.monotonic()
-            self.m._motion_locked(self._print(), None)
-            took = time.monotonic() - t0
-        finally:
-            set_cfg('MOTION.WARM_UP_DELAY', None)
-            set_cfg('MOTION.COOL_DOWN_DELAY', None)
-        self.assertTrue(self.m._running_action_cancelled)
-        self.assertLess(took, 0.35 + 0.3)
-        self.assertNotIn(('run', 1), CNC.writes)
-        self.assertEqual(CNC.latch, 1)
-        self.assertFalse(COOL.armed)
+        self.addCleanup(set_cfg, 'MOTION.WARM_UP_DELAY', None)
+        self.addCleanup(set_cfg, 'MOTION.COOL_DOWN_DELAY', None)
+        rows = (('refuses fire', lambda: (setattr(COOL, '_fire_ok', False), setattr(COOL, 'name', 'SENSOR'))),
+                ('goes missing', lambda: setattr(COOL, 'stale', True)))
+        for name, close in rows:
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                clock = MachineClock(self, self.m)
+                CNC.xy_steps = (0, 0)
+                clock.press(0.05)
+                clock.at(0.35, close)
+                self.m._motion_locked(self._print(), None)
+                self.assertTrue(self.m._running_action_cancelled)
+                self.assertLess(clock.elapsed, 0.35 + machine_mod.DWELL_SLICE_S + 0.05)
+                self.assertNotIn(('run', 1), CNC.writes)
+                self.assertEqual(CNC.latch, 1)
+                self.assertFalse(COOL.armed)
 
     def test_a_fire_blocked_verdict_before_the_run_leaves_the_latch_locked_and_cancels(self):
         # The engine refuses fire for the whole bounded wait (a fail tier
@@ -1892,14 +2016,14 @@ class VerdictHoldTests(unittest.TestCase):
         # The lock that answers fire_ok=false sets the hardware's own button
         # latch: once the verdict is clean the latch is unlocked, and the job
         # resumes on a press taken from then on, not before.
+        clock = MachineClock(self, self.m)
         before_press = []
-        threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
-        SW.press(delay=0.20)                    # under the lock: it does not count
-        threading.Timer(0.40, self._release).start()
-        threading.Timer(0.65, lambda: before_press.append(
-            (('resume', 1950) in CNC.writes, CNC.latch))).start()
-        SW.press(delay=0.80)
-        threading.Timer(1.10, lambda: setattr(CNC, '_reads_left', 1)).start()
+        clock.at(0.05, lambda: setattr(COOL, '_fire_ok', False))
+        clock.press(0.20)                       # under the lock: it does not count
+        clock.at(0.40, self._release)
+        clock.at(0.65, lambda: before_press.append((('resume', 1950) in CNC.writes, CNC.latch)))
+        clock.press(0.80)
+        clock.at(1.10, lambda: setattr(CNC, '_reads_left', 1))
         aborted = self._run()
         self.assertFalse(aborted)
         self.assertFalse(self.m._running_action_cancelled)
@@ -1919,24 +2043,26 @@ class VerdictHoldTests(unittest.TestCase):
 
     def test_the_wait_for_the_press_after_a_relock_has_no_clock_of_its_own(self):
         # Verdict clean and the latch unlocked: the print is where a print
-        # paused on the button is, and waits as that one does. The button's
-        # timeout (1 s here) does not end it: 1.5 s after the unlock it still
-        # waits, breathing, unlocked, not canceled, and the press resumes it.
+        # paused on the button is, and waits as that one does. Neither the
+        # button's timeout (1 s here) nor the hold's bound (0.6 s here) ends
+        # it: 1.5 s after the unlock it still waits, breathing, unlocked,
+        # not canceled, and the press resumes it.
         machine_mod._conf_float = lambda key, default: (
-            1.0 if key == 'laser_button_timeout_s' else 60.0 if key == 'cloud_hold_max_s'
-            else self._conf(key, default))
+            1.0 if key == 'laser_button_timeout_s' else self._conf(key, default))
+        self.m._hold_max_s = lambda: 0.6
+        clock = MachineClock(self, self.m)
         del LEDS.button_colors[:]
         waiting = []
-        threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
-        threading.Timer(0.30, self._release).start()
-        threading.Timer(1.80, lambda: waiting.append(
+        clock.at(0.05, lambda: setattr(COOL, '_fire_ok', False))
+        clock.at(0.30, self._release)
+        clock.at(1.80, lambda: waiting.append(
             (self.m._running_action_cancelled, CNC.latch, CNC.hw_latch, LEDS.button_colors[-1:],
-             ('resume', 1950) in CNC.writes))).start()
-        SW.press(delay=2.10)
-        threading.Timer(2.40, lambda: setattr(CNC, '_reads_left', 1)).start()
+             ('resume', 1950) in CNC.writes)))
+        clock.press(2.10)
+        clock.at(2.40, lambda: setattr(CNC, '_reads_left', 1))
         aborted = self._run()
         self.assertEqual(waiting, [(False, 0, 1, ['breathe'], False)],
-                         'past the button timeout: not canceled, unlocked, breathing, not resumed')
+                         'past both clocks: not canceled, unlocked, breathing, not resumed')
         self.assertFalse(aborted)
         self.assertFalse(self.m._running_action_cancelled)
         self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)],
@@ -1953,34 +2079,70 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertEqual(CNC.latch, 1)
 
     def test_a_verdict_that_closes_again_before_the_press_locks_again(self):
-        # Clean at 0.3 (unlocked, waiting), closed again at 0.5 (locked), a
-        # press at 0.6 under that lock, clean at 0.8, the press that counts
-        # at 1.0.
-        threading.Timer(0.05, lambda: setattr(COOL, '_fire_ok', False)).start()
-        threading.Timer(0.30, self._release).start()
-        threading.Timer(0.50, lambda: (setattr(COOL, '_hold', None), setattr(COOL, '_fire_ok', False))).start()
-        SW.press(delay=0.60)
-        threading.Timer(0.80, self._release).start()
-        SW.press(delay=1.00)
-        threading.Timer(1.30, lambda: setattr(CNC, '_reads_left', 1)).start()
+        # Clean at 0.3 (unlocked, waiting), closed again at 0.5: locked
+        # again and the button dark, so the press at 0.7 is taken under the
+        # lock and leaves the board's latch set. Clean at 0.8, the press
+        # that counts at 1.0.
+        clock = MachineClock(self, self.m)
+        del LEDS.button_colors[:]
+        seen = []
+        clock.at(0.05, lambda: setattr(COOL, '_fire_ok', False))
+        clock.at(0.30, self._release)
+        clock.at(0.50, lambda: (setattr(COOL, '_hold', None), setattr(COOL, '_fire_ok', False)))
+        clock.at(0.65, lambda: seen.append((CNC.latch, LEDS.button_colors[-1:])))
+        clock.press(0.70)
+        clock.at(0.75, lambda: seen.append(CNC.hw_latch))
+        clock.at(0.80, self._release)
+        clock.press(1.00)
+        clock.at(1.30, lambda: setattr(CNC, '_reads_left', 1))
         aborted = self._run()
+        self.assertEqual(seen, [(1, [ButtonColor.OFF]), 1],
+                         'locked and dark once the verdict closed again; the press then left the latch set')
         self.assertFalse(aborted)
         self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)])
+
+    def test_a_verdict_that_closes_again_before_the_press_restarts_the_holds_bound(self):
+        # The hold's bound is 0.6 s here. Held from 0.05, clean at 0.3 and
+        # waiting for the press, closed again at 0.5 and left closed: the
+        # bound runs again from 0.5, so the job is still held at 0.85 and
+        # canceled before 1.4.
+        self.m._hold_max_s = lambda: 0.6
+        clock = MachineClock(self, self.m)
+        held = []
+        clock.at(0.05, lambda: setattr(COOL, '_fire_ok', False))
+        clock.at(0.30, self._release)
+        clock.at(0.50, lambda: (setattr(COOL, '_hold', None), setattr(COOL, '_fire_ok', False)))
+        clock.at(0.85, lambda: held.append(self.m._running_action_cancelled))
+        self.assertTrue(self._run())
+        self.assertEqual(held, [False], 'canceled on the bound of the first hold')
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertLess(clock.elapsed, 1.4)
 
     def test_a_print_paused_on_the_button_under_a_relock_resumes_on_a_press_after_the_unlock(self):
         # Paused at 0.05; the verdict refuses fire with no hold asked from
         # 0.2 (the latch locks under the pause); a press at 0.35 is taken
-        # under the lock and resumes nothing; fire permitted again at 0.5
-        # (unlocked); the press at 0.8 resumes.
-        SW.press(delay=0.05)
-        threading.Timer(0.20, lambda: (setattr(COOL, '_hold', False), setattr(COOL, '_fire_ok', False))).start()
-        SW.press(delay=0.35)
-        threading.Timer(0.50, self._release).start()
-        SW.press(delay=0.80)
-        threading.Timer(1.10, lambda: setattr(CNC, '_reads_left', 1)).start()
+        # under the lock and resumes nothing; at 0.5 fire is permitted but
+        # a hold is asked, and the lock stays; clean at 0.7 (unlocked); the
+        # press at 0.9 resumes. That press was taken with the latch unlocked,
+        # so the hold with fire permitted from 1.1 to 1.3 resumes without
+        # another; a job left waiting for one is canceled at 3.0.
+        clock = MachineClock(self, self.m)
+        locked = []
+        clock.press(0.05)
+        clock.at(0.20, lambda: (setattr(COOL, '_hold', False), setattr(COOL, '_fire_ok', False)))
+        clock.press(0.35)
+        clock.at(0.50, lambda: (setattr(COOL, '_hold', True), setattr(COOL, '_fire_ok', True)))
+        clock.at(0.60, lambda: locked.append(CNC.latch))
+        clock.at(0.70, self._release)
+        clock.press(0.90)
+        clock.at(1.10, lambda: setattr(COOL, '_hold', True))
+        clock.at(1.30, self._release)
+        clock.at(1.60, lambda: setattr(CNC, '_reads_left', 1))
+        clock.at(3.00, lambda: setattr(self.m, '_running_action_cancelled', True))
         aborted = self._run()
+        self.assertEqual(locked, [1], 'the lock released while a hold was still asked')
         self.assertFalse(aborted)
-        self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)])
+        self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)] * 2)
 
     def test_a_feed_hold_whose_latch_was_locked_under_it_resumes_on_a_press(self):
         self.m._feeder = FakeFeeder(written=100)
@@ -1988,13 +2150,14 @@ class VerdictHoldTests(unittest.TestCase):
         machine_mod.FEED_STALL_S, machine_mod.FEED_RECOVER_S = 0.1, 5.0
         self.addCleanup(setattr, machine_mod, 'FEED_STALL_S', fs)
         self.addCleanup(setattr, machine_mod, 'FEED_RECOVER_S', fr)
+        clock = MachineClock(self, self.m)
         # Held for the feed from about 0.1; fire refused with no hold asked
         # from 0.3 to 0.5 (locked, then permitted); the feed moves at 0.6.
-        threading.Timer(0.30, lambda: (setattr(COOL, '_hold', False), setattr(COOL, '_fire_ok', False))).start()
-        threading.Timer(0.50, self._release).start()
-        threading.Timer(0.60, lambda: setattr(self.m._feeder, 'moving', True)).start()
-        SW.press(delay=1.00)
-        threading.Timer(1.30, lambda: (setattr(self.m._feeder, 'finished', True), setattr(CNC, '_reads_left', 1))).start()
+        clock.at(0.30, lambda: (setattr(COOL, '_hold', False), setattr(COOL, '_fire_ok', False)))
+        clock.at(0.50, self._release)
+        clock.at(0.60, lambda: setattr(self.m._feeder, 'moving', True))
+        clock.press(1.00)
+        clock.at(1.30, lambda: (setattr(self.m._feeder, 'finished', True), setattr(CNC, '_reads_left', 1)))
         aborted = self._run()
         self.assertFalse(aborted)
         self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)])
@@ -2002,9 +2165,10 @@ class VerdictHoldTests(unittest.TestCase):
     def test_a_hold_with_fire_permitted_pauses_without_the_latch(self):
         # A hold asked with fire still permitted, as the verdict file may
         # say: the pause, not the latch.
-        threading.Timer(0.05, lambda: setattr(COOL, '_hold', True)).start()
-        threading.Timer(0.40, self._release).start()
-        threading.Timer(0.70, lambda: setattr(CNC, '_reads_left', 1)).start()
+        clock = MachineClock(self, self.m)
+        clock.at(0.05, lambda: setattr(COOL, '_hold', True))
+        clock.at(0.40, self._release)
+        clock.at(0.70, lambda: setattr(CNC, '_reads_left', 1))
         aborted = self._run()
         self.assertFalse(aborted)
         w = CNC.writes
@@ -2015,25 +2179,92 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertNotIn(('laser_latch', 1), w[:w.index(('resume', 1950))])
         self.assertEqual(CNC.starts[-1], ('resume', 0, 0))
 
+    # -- the button in the run: solid white while the job moves, breathing
+    #    while a press would resume it, dark while one would not ----------
+    def test_the_button_is_white_while_the_job_moves_and_breathes_while_a_press_would_resume_it(self):
+        # Paused on the button at 0.1 with the latch unlocked, resumed by the
+        # press at 0.5; the button read at 0.05, 0.35 and 0.75.
+        del LEDS.button_colors[:]
+        lamp = []
+        for at in (0.05, 0.35, 0.75):
+            SW._later(at, lambda: lamp.append(LEDS.button_colors[-1:]))
+        SW.press(delay=0.10)
+        SW.press(delay=0.50)
+        SW._later(0.90, lambda: setattr(CNC, '_reads_left', 1))
+        self.assertFalse(self._run())
+        self.assertEqual(lamp, [[ButtonColor.WHITE], ['breathe'], [ButtonColor.WHITE]],
+                         'moving, paused on the button, moving again')
+
+    def test_the_button_is_dark_while_a_press_would_not_resume_the_job(self):
+        # Each row has the job stopped by 0.3 s, reads the button at 0.45 and
+        # cancels at 0.55. The two pauses breathe until 0.2, when the verdict
+        # asks for a hold, or refuses fire with no hold asked, under them.
+        fs, fr = machine_mod.FEED_STALL_S, machine_mod.FEED_RECOVER_S
+        self.addCleanup(setattr, machine_mod, 'FEED_STALL_S', fs)
+        self.addCleanup(setattr, machine_mod, 'FEED_RECOVER_S', fr)
+        machine_mod.FEED_STALL_S, machine_mod.FEED_RECOVER_S = 0.1, 5.0
+
+        def paused_under(hold, fire_ok):
+            SW.press(delay=0.05)
+            SW._later(0.20, lambda: (setattr(COOL, '_hold', hold), setattr(COOL, '_fire_ok', fire_ok)))
+        rows = (
+            ('a cooling hold', lambda: SW._later(0.05, lambda: setattr(COOL, '_fire_ok', False))),
+            ('a feed hold', lambda: setattr(self.m, '_feeder', FakeFeeder(written=100))),
+            ('a pause under a cooling hold', lambda: paused_under(True, True)),
+            ('a pause under a set lock', lambda: paused_under(False, False)),
+        )
+        for name, arrange in rows:
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                del LEDS.button_colors[:]
+                lamp = []
+                arrange()
+                SW._later(0.45, lambda: lamp.append(LEDS.button_colors[-1:]))
+                SW._later(0.55, lambda: setattr(self.m, '_running_action_cancelled', True))
+                self.assertTrue(self._run())
+                self.assertEqual(lamp, [[ButtonColor.OFF]])
+
+    def test_the_run_puts_its_lamp_back_once_something_wrote_over_it(self):
+        # forgectrl's red flash is on the button from the start, and leaves
+        # it dark at 0.6: the run writes nothing over the red, and puts its
+        # solid white back at its next look (once a second). The program
+        # ends at 1.5.
+        self.addCleanup(setattr, LEDS, 'pattern', None)
+        clock = MachineClock(self, self.m)
+        LEDS.pattern = 'red'
+        del LEDS.button_colors[:]
+        under_red = []
+        clock.at(0.60, lambda: (under_red.append(LEDS.button_colors.count(ButtonColor.WHITE)),
+                                setattr(LEDS, 'pattern', 'off')))
+        clock.at(1.50, lambda: setattr(CNC, '_reads_left', 1))
+        self.assertFalse(self._run())
+        self.assertEqual(under_red, [1], 'the run start alone, nothing over the red')
+        self.assertEqual(LEDS.button_colors.count(ButtonColor.WHITE), 2, 'put back once')
+
     def _hold_events(self):
         return [e for e in EVENTS if e.startswith('fault:') or e in ('print:paused', 'print:resumed')]
 
     def _hold_and_clear(self, name, reason=''):
+        clock = MachineClock(self, self.m)
+
         def hold():
             COOL.name = name
             COOL.reason = reason
             COOL._fire_ok = False
-        threading.Timer(0.05, hold).start()
-        threading.Timer(0.40, self._release).start()
-        SW.press(delay=0.60)                    # the press the relock costs
-        threading.Timer(0.90, lambda: setattr(CNC, '_reads_left', 1)).start()
+        clock.at(0.05, hold)
+        clock.at(0.40, self._release)
+        clock.press(0.60)                       # the press the relock costs
+        clock.at(0.90, lambda: setattr(CNC, '_reads_left', 1))
         self._run()
 
     def test_the_app_hears_why_a_print_is_held(self):
         for name, reason, fault in (
                 ('OVERTEMP', '', 'coolant_recoverable_alert'),
                 ('BUMP', '', 'head_accel_x_alert'),
+                ('CRASH', '', 'head_accel_x_alert'),
                 ('FLAME', '', 'lid_ir_1st_quartile_alert'),
+                ('FIRE', '', 'lid_ir_1st_quartile_alert'),
                 ('CRITICAL', '', 'interior_temp_alert'),
                 ('AIRFLOW', 'AIRFLOW: exhaust 11640 under', 'exhaust_fan_alert'),
                 ('AIRFLOW', 'AIRFLOW: intake_2 0 under', 'intake_2_fan_alert'),
@@ -2048,12 +2279,46 @@ class VerdictHoldTests(unittest.TestCase):
                                   'fault:%s:reset' % fault, 'print:resumed'])
 
     def test_a_hold_with_no_message_of_its_own_is_a_plain_pause(self):
-        for name in ('SENSOR', 'COLD', 'EXT'):
-            with self.subTest(name=name):
+        for name, reason in (('SENSOR', ''), ('COLD', ''), ('EXT', ''),
+                             ('AIRFLOW', 'AIRFLOW: an unnamed fan under')):
+            with self.subTest(name=name, reason=reason):
                 self.tearDown()
                 self.setUp()
-                self._hold_and_clear(name)
+                self._hold_and_clear(name, reason)
                 self.assertEqual(self._hold_events()[:2], ['print:paused', 'print:resumed'])
+
+    def test_the_fault_the_app_hears_follows_the_verdict_that_holds(self):
+        # Held on OVERTEMP from 0.05, the name CRITICAL from 0.2 (fire still
+        # refused), COLD from 0.35 (no fault of its own), clean at 0.5, the
+        # press at 0.7: each change resets the old fault before the new one
+        # is set.
+        clock = MachineClock(self, self.m)
+        clock.at(0.05, lambda: (setattr(COOL, 'name', 'OVERTEMP'), setattr(COOL, '_fire_ok', False)))
+        clock.at(0.20, lambda: setattr(COOL, 'name', 'CRITICAL'))
+        clock.at(0.35, lambda: setattr(COOL, 'name', 'COLD'))
+        clock.at(0.50, self._release)
+        clock.press(0.70)
+        clock.at(1.00, lambda: setattr(CNC, '_reads_left', 1))
+        self.assertFalse(self._run())
+        self.assertEqual(self._hold_events(),
+                         ['fault:coolant_recoverable_alert:set', 'print:paused',
+                          'fault:coolant_recoverable_alert:reset', 'fault:interior_temp_alert:set',
+                          'fault:interior_temp_alert:reset', 'print:resumed'])
+
+    def test_an_action_that_ends_in_an_exception_leaves_no_fault_set(self):
+        # The action fails while a fault is up: motion() resets it on the
+        # way out.
+        self.m._q_msg_tx = queue.Queue()        # the base class's own events
+
+        def held_then_failed(msg):
+            self.m._fault_report({'verdict': 'OVERTEMP'})
+            raise RuntimeError('the job failed while held')
+        self.m._motion = held_then_failed
+        with self.assertRaises(RuntimeError):
+            self.m.motion({'id': 42, 'action_type': 'print', 'motion_url': 'x'})
+        self.assertEqual(self._hold_events(), ['fault:coolant_recoverable_alert:set',
+                                               'fault:coolant_recoverable_alert:reset'])
+        self.assertIsNone(self.m._fault_up)
 
     def test_no_fault_stays_set_at_the_service(self):
         # Canceled while held: the record at the service must not keep it.
@@ -2067,6 +2332,15 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertIn('fault:coolant_recoverable_alert:set', events)
         self.assertIn('fault:coolant_recoverable_alert:reset', events)
         self.assertIsNone(self.m._fault_up)
+
+    def test_every_start_resets_every_hold_fault_in_the_map(self):
+        # A client stopped mid-hold (the fail tiers restart it) could not
+        # reset its own fault: the next start resets every fault in the map,
+        # and sets none.
+        self.m.start(None, queue.Queue())
+        faults = set(machine_mod.HOLD_FAULTS.values()) | {f for _, f in machine_mod.AIRFLOW_FAULTS}
+        self.assertEqual({e for e in EVENTS if e.startswith('fault:')},
+                         {'fault:%s:reset' % f for f in faults})
 
     def test_a_hold_past_its_bound_cancels(self):
         # the bound is clamped to 60 s and up: patch the reader the loop uses
@@ -2087,10 +2361,11 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertEqual(CNC.writes.count(('stop', 1)), 1)     # the hold's stop, no second
 
     def test_a_lost_verdict_holds_and_falls_back(self):
-        threading.Timer(0.05, lambda: setattr(COOL, 'stale', True)).start()
-        threading.Timer(0.40, lambda: setattr(COOL, 'stale', False)).start()
-        SW.press(delay=0.60)                    # the press the relock costs
-        threading.Timer(0.90, lambda: setattr(CNC, '_reads_left', 1)).start()
+        clock = MachineClock(self, self.m)
+        clock.at(0.05, lambda: setattr(COOL, 'stale', True))
+        clock.at(0.40, lambda: setattr(COOL, 'stale', False))
+        clock.press(0.60)                       # the press the relock costs
+        clock.at(0.90, lambda: setattr(CNC, '_reads_left', 1))
         aborted = self._run()
         self.assertFalse(aborted)
         self.assertEqual(self.heater_offs, 1)
@@ -2113,17 +2388,22 @@ class VerdictHoldTests(unittest.TestCase):
 
     def test_a_run_does_not_start_on_a_verdict_that_refuses_fire_or_without_the_press(self):
         # The last look before the run: no start under a verdict that
-        # refuses fire, and none without a press taken with the latch
-        # unlocked. Either way the latch ends locked and the job canceled.
-        for case in ('verdict', 'press'):
+        # refuses fire or is missing, and none without a press taken with
+        # the latch unlocked. Each way the latch ends locked and the job
+        # canceled. On machine time, a run that did start ends at the
+        # clock's horizon.
+        for case in ('verdict', 'missing', 'press'):
             with self.subTest(case=case):
                 self.tearDown()
                 self.setUp()
+                MachineClock(self, self.m)
                 CNC.latch = 0
                 CNC.hw_latch = 0
                 self.m._press_live = case != 'press'
                 if case == 'verdict':
                     COOL.absent = ('fire_ok',)
+                elif case == 'missing':
+                    COOL.stale = True
                 aborted = self.m._run_loop(pausable=True, lit=True)
                 self.assertTrue(aborted)
                 self.assertTrue(self.m._running_action_cancelled)
@@ -2175,11 +2455,12 @@ class VerdictHoldTests(unittest.TestCase):
             vars(CNC).pop('resume', None)
 
     def test_the_button_does_not_resume_under_a_hold(self):
-        SW.press(delay=0.05)                         # pause
-        threading.Timer(0.20, lambda: setattr(COOL, '_hold', True)).start()
-        SW.press(delay=0.40)                         # a resume the engine forbids
-        threading.Timer(0.70, self._release).start()
-        threading.Timer(1.00, lambda: setattr(CNC, '_reads_left', 1)).start()
+        clock = MachineClock(self, self.m)
+        clock.press(0.05)                            # pause
+        clock.at(0.20, lambda: setattr(COOL, '_hold', True))
+        clock.press(0.40)                            # a resume the engine forbids
+        clock.at(0.70, self._release)
+        clock.at(1.00, lambda: setattr(CNC, '_reads_left', 1))
         aborted = self._run()
         self.assertFalse(aborted)
         w = CNC.writes
@@ -2245,6 +2526,8 @@ class VerdictWaitTests(unittest.TestCase):
         # before the button, unlocked only once the run starts.
         self.assertNotIn(('laser_latch', 0), CNC.writes)
         self.assertNotIn(('laser_latch', 1), CNC.writes)
+        # A hold with no fault of its own tells the app nothing.
+        self.assertEqual([e for e in EVENTS if e.startswith(('print:', 'fault:'))], [])
 
     def test_a_clean_verdict_does_not_wait(self):
         COOL.armed = True
@@ -2292,12 +2575,16 @@ class VerdictWaitTests(unittest.TestCase):
         self.assertFalse(COOL.armed)
 
     def test_a_lost_verdict_ends_the_wait(self):
+        # The first wait gives a missing verdict no grace: gone at 0.1, it
+        # ends the wait at the next pass.
+        clock = MachineClock(self, self.m)
         COOL._fire_ok = False
         COOL.armed = True
-        threading.Timer(0.1, lambda: setattr(COOL, 'stale', True)).start()
+        clock.at(0.1, lambda: setattr(COOL, 'stale', True))
         self.m._verdict_wait()
         self.assertTrue(self.m._running_action_cancelled)
         self.assertIn(('laser_latch', 1), CNC.writes)
+        self.assertLess(clock.elapsed, 0.1 + 0.6)
 
     def test_the_bound_ends_the_wait(self):
         self.m._hold_max_s = lambda: 0.2
@@ -2335,6 +2622,7 @@ class VerdictWaitTests(unittest.TestCase):
                                 'fault:coolant_recoverable_alert:reset'])
 
     def test_an_unacknowledged_fault_ends_the_wait_at_once(self):
+        self.m._hold_max_s = lambda: 1.0       # a wait that sat it out ends in a second
         COOL._fire_ok = False
         COOL.armed = True
         COOL.name = 'ACK'
