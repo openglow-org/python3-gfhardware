@@ -41,12 +41,8 @@ def _led_int(path: str):
 def button_pattern():
     """What the button shows: 'red' (forgectrl's flash: red pulsing, green
     and blue dark), 'breathe', 'white', 'off', 'other', or None when it
-    cannot be read.
-
-    Solid white is nothing pulsing and every target at 254 or 255: the LED
-    trigger ends a fade once it is within a sixteenth of the target and
-    takes the value it reached as the target, so a 255 that has settled
-    reads back 254."""
+    cannot be read. Solid white is nothing pulsing and every target at
+    255."""
     p, t = [], []
     for led in range(1, 4):
         p.append(_led_int(BUTTON_LED % led + 'pulse_on'))
@@ -57,7 +53,7 @@ def button_pattern():
         return 'red'
     if all(v > 0 for v in p):
         return 'breathe'
-    if all(v == 0 for v in p) and all(v >= 254 for v in t):
+    if all(v == 0 for v in p) and all(v == 255 for v in t):
         return 'white'
     if all(v == 0 for v in p) and all(v == 0 for v in t):
         return 'off'
