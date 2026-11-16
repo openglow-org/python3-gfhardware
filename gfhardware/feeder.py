@@ -9,6 +9,7 @@ import errno
 import logging
 import re
 import threading
+from array import array
 from time import monotonic
 
 from gfutilities.puls import decode_all_steps
@@ -42,6 +43,13 @@ _BACKOFF = (errno.ENOMEM, errno.EBUSY, errno.EAGAIN)
 # before the FIRE byte reaches the ring.
 _POWER_BYTE = re.compile(rb'[\x80-\xff]')
 _FIRE_BYTE = re.compile(rb'[\x10-\x1f\x30-\x3f\x50-\x5f\x70-\x7f]')
+
+# The power bytes of everything written, counted per POWER_BLOCK payload
+# bytes. A power byte plays in the same tick as the step byte after it, so a
+# stretch of the job lasts as many ticks as it holds step bytes, not bytes:
+# what a pause needs to size its resume's laser-off lead in ticks.
+POWER_BLOCK = 256
+_POWER_FLAGS = bytes(1 if b & 0x80 else 0 for b in range(256))
 
 
 class PulseBodyError(Exception):
@@ -83,6 +91,8 @@ class PulseFeeder:
         self._books = threading.Lock()
         self._powered = False           # a power byte has been seen
         self._scanned = 0               # payload bytes checked so far
+        self._power_counts = array('H')  # power bytes per POWER_BLOCK written
+        self._indexed = 0               # payload bytes counted into it
 
     # -- state -----------------------------------------------------------
     @property
@@ -94,6 +104,58 @@ class PulseFeeder:
     def written(self) -> int:
         """Payload bytes accepted by the device so far."""
         return self._written
+
+    @property
+    def chunk(self) -> int:
+        """Bytes offered to the ring per write: ``written`` moves by this
+        much at a time, so a live feed shows no progress while one chunk's
+        worth of ring drains."""
+        return self._chunk
+
+    @property
+    def indexed(self) -> int:
+        """Payload bytes whose power bytes have been counted: everything the
+        ring has taken."""
+        return self._indexed
+
+    def lead_bytes(self, start: int, ticks: int):
+        """The fewest payload bytes from offset ``start`` whose step bytes
+        cover ``ticks`` ticks: what a laser-off lead from there must count to
+        last that long. Power bytes are known per POWER_BLOCK only, so they
+        are taken to sit at the window's start in every block it touches:
+        the answer never falls short. None when the window runs past what has
+        been written."""
+        counts, indexed = self._power_counts, self._indexed
+        if start < 0:
+            return None
+        block, off = divmod(start, POWER_BLOCK)
+        need, length = ticks, 0
+        while need > 0:
+            span = min(POWER_BLOCK, indexed - block * POWER_BLOCK) - off
+            if span <= 0:
+                return None
+            power = counts[block]
+            steps = max(0, span - power)
+            if steps >= need:
+                return length + min(span, power + need)
+            length += span
+            need -= steps
+            block += 1
+            off = 0
+        return length
+
+    def _index_power(self, chunk: bytes) -> None:
+        """Count the power bytes of a chunk the ring took, per POWER_BLOCK of
+        the job's payload."""
+        flags = chunk.translate(_POWER_FLAGS)
+        pos = 0
+        part = self._indexed % POWER_BLOCK
+        if part:
+            pos = min(POWER_BLOCK - part, len(flags))
+            self._power_counts[-1] += flags.count(1, 0, pos)
+        for at in range(pos, len(flags), POWER_BLOCK):
+            self._power_counts.append(flags.count(1, at, at + POWER_BLOCK))
+        self._indexed += len(chunk)
 
     @property
     def error(self) -> Exception:
@@ -261,6 +323,7 @@ class PulseFeeder:
                 self._account()
                 self._stop.wait(self._retry_s)
                 continue
+            self._index_power(chunk)
             self._written += len(chunk)
             with self._books:
                 self._pending.append(chunk)

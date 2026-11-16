@@ -298,6 +298,47 @@ class PulseBodyTests(unittest.TestCase):
         self.assertFalse(feeder.finished)
         feeder.stop()
 
+    def test_every_byte_value_is_judged_by_its_class(self):
+        # Each of the 256 values as the first byte after step bytes: a FIRE
+        # byte (bit 7 clear, bit 4 set; it carries step bits) is refused, a
+        # power byte (bit 7 set) licenses the FIRE bytes after it, and any
+        # other step byte does neither.
+        for value in range(256):
+            with self.subTest(value=hex(value)):
+                feeder = PulseFeeder(PulseSource(_puls(b'')), FakeRing(1 << 20))
+                fit = feeder._fit_for_the_ring(STEP * 5 + bytes([value]))
+                if not value & 0x80 and value & 0x10:
+                    self.assertFalse(fit)
+                    self.assertIsInstance(feeder.error, PulseBodyError)
+                else:
+                    self.assertTrue(fit)
+                    self.assertEqual(feeder._fit_for_the_ring(FIRE), bool(value & 0x80))
+
+    def test_the_power_bytes_written_size_a_lead_in_step_ticks(self):
+        # A pause sizes its resume's lead in ticks, and a power byte plays in
+        # the same tick as the step byte after it. The feeder counts the
+        # power bytes of what the ring took (power bytes in the part of a
+        # count block a later chunk completes included) and answers the
+        # fewest bytes from an offset, inside a block or on its start, whose
+        # step bytes cover the ticks, taking a block's power bytes to come
+        # first: exact for a stream that puts them there.
+        payload = (POWERED + STEP * 3071 + POWERED * 300 + STEP * 628
+                   + POWERED * 10 + STEP * 86)                  # 4096 bytes
+        feeder, ring = self._feed(payload, chunk=1000)
+        self.assertTrue(_wait(lambda: feeder.finished))
+        self.assertEqual(feeder.lead_bytes(256, 100), 100)
+        # From 3072 (past a chunk's end at 3000): 300 power bytes, then 50
+        # step bytes.
+        self.assertEqual(feeder.lead_bytes(3072, 50), 350)
+        # From 3016, 200 bytes into its block: the block's last 56 bytes,
+        # all step bytes, then the 300 power bytes, then 44 step bytes.
+        self.assertEqual(feeder.lead_bytes(3016, 100), 400)
+        # From 3840: 160 step bytes, 10 power bytes that came in the chunk
+        # after the one that opened their block, then 40 step bytes.
+        self.assertEqual(feeder.lead_bytes(3840, 200), 210)
+        self.assertIsNone(feeder.lead_bytes(3072, 2000))      # past what was written
+        feeder.stop()
+
     def test_a_power_byte_first_is_accepted(self):
         payload = STEP * 10 + POWERED + STEP * 100 + FIRE * 50 + STEP * 20
         feeder, ring = self._feed(payload)

@@ -282,6 +282,11 @@ class _CNC(object):
         return int(read_file(SYSFS_GF_BASE + 'cnc/step_freq'))
 
     @property
+    def ramp_rate(self) -> int:
+        """The stop and resume ramp in force, in Hz/s (a multiple of 100)."""
+        return int(read_file(SYSFS_GF_BASE + 'cnc/ramp_rate'))
+
+    @property
     def streaming(self) -> bool:
         """Whether end-of-data mid-run counts as an underrun."""
         return read_file(SYSFS_GF_BASE + 'cnc/streaming').strip() == '1'

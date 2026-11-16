@@ -8,6 +8,7 @@ import errno
 import fcntl
 import json
 import logging
+import math
 import os
 import time
 from threading import Event
@@ -131,6 +132,67 @@ MACHINE_CONF = os.environ.get('GFHOME_CONF', '/data/forgefirm/forgefirm.conf')
 FEED_STALL_S = 30.0        # no progress, with room to write, is a stalled feed
 FEED_RECOVER_S = 60.0      # how long a held job waits for the feed to move
 FEED_MAX_HOLDS = 3         # a feed that keeps stalling is sawing the material
+# A healthy feeder writes nothing while the chunk it last wrote drains, and
+# then writes within its retry (feeder.RETRY_S) of the room appearing. At a
+# slow print tick a chunk drains for longer than FEED_STALL_S, so the stall
+# bound is at least the chunk's drain time with this margin over it.
+FEED_DRAIN_MARGIN = 1.1
+
+
+def feed_stall_s(chunk: int, step_freq: int) -> float:
+    """How long a live feed may make no progress, with room to write, before
+    it is a stalled feed: FEED_STALL_S, or longer at a print tick slow enough
+    that one chunk takes longer than that to drain."""
+    if step_freq <= 0:
+        return FEED_STALL_S
+    return max(FEED_STALL_S, FEED_DRAIN_MARGIN * chunk / step_freq)
+
+
+# The resume ramp, as the kernel module computes it (cnc_ramp.h, whose
+# refusal of a short lead uses the same arithmetic): a resume starts at
+# RAMP_MIN_HZ and gains the ramp rate's per-update step every
+# 1/RAMP_UPDATES_PER_SEC s until it reaches the step rate.
+RAMP_MIN_HZ = 900
+RAMP_UPDATES_PER_SEC = 100
+
+
+def resume_ramp_bytes(step_freq: int, ramp_rate: int):
+    """Bytes a resume's acceleration plays below ``step_freq`` (Hz) at
+    ``ramp_rate`` (Hz/s): one update interval at each frequency from the
+    floor up, each counted whole. A laser-off lead shorter than this puts the
+    job's FIRE bytes on the path while the engine still accelerates, below
+    the commanded speed. None when no ramp reaches the step rate."""
+    delta = int(ramp_rate) // RAMP_UPDATES_PER_SEC
+    if delta <= 0:
+        return None
+    freq, played = RAMP_MIN_HZ, 0
+    while freq < step_freq:
+        played += -(-freq // RAMP_UPDATES_PER_SEC)
+        freq += delta
+    return played
+
+
+def resume_lead_min(step_freq: int, ramp_rate: int):
+    """The shortest laser-off lead a resume is given, in ticks: the ticks
+    its acceleration plays (resume_ramp_bytes, the kernel's own refusal
+    threshold) and one more update interval at the step rate, for a ramp
+    update that runs late (the interval at the last ramp frequency then
+    lasts longer). The lead's power bytes are counted on top of this, since
+    each plays in the same tick as the step byte after it
+    (Machine._lead_bytes). None when no ramp reaches the step rate."""
+    ramp = resume_ramp_bytes(step_freq, ramp_rate)
+    if ramp is None:
+        return None
+    return ramp + -(-int(step_freq) // RAMP_UPDATES_PER_SEC)
+
+
+# Both cloud pause keys take what forgectrl's settings accept; a stored
+# value outside that range is the panel's "unset", and the default stands.
+PAUSE_TICKS_MIN = 500
+PAUSE_TICKS_MAX = 30000
+# The longest backward run or lead the kernel's resume takes: its waypoint
+# counter is 28 bits wide.
+RESUME_STEPS_MAX = (1 << 28) - 1
 
 # A print's warm-up and its rest, in seconds. The factory does both: a print
 # holds 3.05 s between configuring the run and starting it, and rests about
@@ -490,15 +552,15 @@ class Machine(BaseMachine):
 
     def _latch_unlock(self) -> bool:
         """Release the lock, for the press that comes next. A press from
-        before this moment does not count: the hardware ignored it.
-        Returns whether the latch unlocked. The kernel refuses the unlock
-        (EBUSY) while the cooling engine holds the latch, its own hold that
-        no controller unlock undoes, and then nothing changed: the latch is
-        still locked and no press can count. A run of refusals is named
-        once, until an unlock takes."""
+        before this moment does not count: the hardware ignored it. The
+        presses are forgotten after the unlock has reached the kernel, so a
+        press counted while it was on its way is dropped, never taken as
+        one the hardware let through. Returns whether the latch unlocked.
+        The kernel refuses the unlock (EBUSY) while the cooling engine holds
+        the latch, its own hold that no controller unlock undoes, and then
+        nothing changed: the latch is still locked and no press can count. A
+        run of refusals is named once, until an unlock takes."""
         self._press_live = False
-        self._button_pressed = False
-        self._button_edges = 0
         try:
             cnc.laser_latch(0)
         except OSError as e:
@@ -508,8 +570,29 @@ class Machine(BaseMachine):
                 self._latch_refusal_told = True
                 logger.warning('the laser latch stays locked: the cooling engine holds it')
             return False
+        finally:
+            self._button_pressed = False
+            self._button_edges = 0
         self._latch_refusal_told = False
         return True
+
+    @staticmethod
+    def _pause_ticks() -> tuple:
+        """The cloud pause's backtrack and resume lead in ticks: the shared
+        cloud_pause_backtrack_ticks and cloud_resume_lead_ticks (defaults
+        2000 and 1950). A value outside what forgectrl's settings accept
+        (PAUSE_TICKS_MIN to PAUSE_TICKS_MAX) is what the panel shows as
+        unset, and its default stands."""
+        ticks = []
+        for key, default in (('cloud_pause_backtrack_ticks', 2000),
+                             ('cloud_resume_lead_ticks', 1950)):
+            value = _conf_float(key, default)
+            if not (math.isfinite(value) and PAUSE_TICKS_MIN <= value <= PAUSE_TICKS_MAX):
+                logger.warning('%s = %s is outside %d to %d; using %d', key, value,
+                               PAUSE_TICKS_MIN, PAUSE_TICKS_MAX, default)
+                value = default
+            ticks.append(int(value))
+        return tuple(ticks)
 
     @staticmethod
     def _button_timeout_s() -> float:
@@ -1357,49 +1440,156 @@ class Machine(BaseMachine):
                              ' '.join('%s=%s' % (k, header[k]) for k in declared))
         return gaps
 
-    def _retrace(self, backtrack: int) -> tuple:
-        """Walk back over ground the job already cut, with the laser off.
+    def _retrace(self, backtrack: int, overlap: int) -> tuple:
+        """Walk back over ground the job already cut, with the laser off, and
+        size the lead of the resume that follows.
 
         Called with the machine stopped and idle, by the button pause and by
-        the feed watchdog alike. Returns ``(ok, retraced)``: ``ok`` is False
-        only if the kernel faulted, and ``retraced`` is the ticks actually
-        walked, which the ring's retained history bounds. A refusal is not
-        fatal - the job holds where the deceleration left it - but the resume
-        that follows has to lead by what was retraced rather than by what was
-        asked for.
+        the holds alike. Returns ``(ok, lead)``: ``ok`` is False only if the
+        kernel faulted; ``lead`` is the resume's laser-off lead in bytes, or
+        None when no safe lead exists, and the caller then cancels the job
+        here, at the pause.
+
+        The lead must outlast the resume's acceleration at the step rate and
+        the ramp in force, with one ramp interval to spare (resume_lead_min,
+        in ticks): a shorter one puts the job's FIRE bytes on the path below
+        the commanded speed. The kernel counts the lead in bytes, and a
+        power byte plays in the same tick as the step byte after it, so the
+        lead holds that many ticks of step bytes (_lead_bytes). It must not
+        pass what was retraced either: the beam would come back on past the
+        pause point and leave the cut unburned there. So the retrace is
+        sized to hold that lead and the overlap, the lead is what was
+        retraced less the overlap, lengthened to what the window the resume
+        plays needs where it falls short. A window that needs more than was
+        retraced gets one more backward run, for the shortfall and the
+        overlap, with the point the beam comes back on by left where it
+        was; still short, refused, or longer than the history, it leaves no
+        safe lead. A history shorter than the lead or a refused backtrack
+        gets one more read of the history and one more ask; a second, or a
+        step rate or ramp that cannot be read, leaves no safe lead.
         """
         try:
-            budget = max(0, cnc.max_backtrack)
-        except (OSError, ValueError):
-            # No readback: ask for the configured distance and let the kernel
-            # refuse it if the history is short.
-            budget = backtrack
-        retraced = min(backtrack, budget)
-        if retraced < backtrack:
-            logger.info('retracing %d ticks of the %d asked for; that is what '
-                        'the ring still holds', retraced, backtrack)
-        if retraced <= 0:
-            return True, 0
+            step_freq, ramp_rate = cnc.step_freq, cnc.ramp_rate
+        except (OSError, ValueError) as e:
+            logger.error('the step rate or the ramp cannot be read (%s); no resume '
+                         'can be sized', e)
+            return True, None
+        lead_min = resume_lead_min(step_freq, ramp_rate)
+        if lead_min is None:
+            logger.error('no ramp reaches the step rate (%d Hz at %d Hz/s); no resume '
+                         'can be sized', step_freq, ramp_rate)
+            return True, None
+        stop_at = self._played()
+        want = backtrack
+        for _ in range(2):
+            try:
+                budget = max(0, cnc.max_backtrack)
+            except (OSError, ValueError):
+                # No readback: no bound but the waypoint counter's, so the
+                # ask grows to what the lead needs, and the kernel refuses
+                # it if the history is short.
+                budget = RESUME_STEPS_MAX
+            retraced = min(want, budget)
+            # The resume plays from about stop_at - retraced (the backward
+            # run's deceleration adds a tail, sized again below once the
+            # run has ended): size the retrace to hold the lead that window
+            # needs, with the overlap.
+            for _ in range(3):
+                need = self._lead_bytes(None if stop_at is None else stop_at - retraced,
+                                        lead_min)
+                if need + overlap <= retraced or retraced >= budget:
+                    break
+                retraced = min(need + overlap, budget)
+            if retraced < need:
+                # A failed head sync reads as no history: read it once more.
+                logger.warning('the ring holds %d bytes of history and a resume at %d Hz '
+                               'needs a %d-byte lead', retraced, step_freq, need)
+                continue
+            if retraced < want:
+                logger.info('retracing %d ticks of the %d asked for; that is what '
+                            'the ring still holds', retraced, want)
+            try:
+                cnc.resume(-retraced)
+            except OSError as e:
+                logger.warning('backtrack of %d ticks refused (%s)', retraced, e)
+                continue
+            if not self._wait_kernel_idle():
+                return False, None
+            # The window the resume really plays starts where the backward
+            # run's deceleration ended. The beam comes back on no later than
+            # where a lead of everything retraced from there would end.
+            played = self._played()
+            need = self._lead_bytes(played, lead_min)
+            room = retraced
+            if need > room and played is not None:
+                # The window needs more than was retraced: one more backward
+                # run, dark as every backward run is, for the shortfall and
+                # the overlap. The point the beam comes back on by stays
+                # where it was, and the window is sized again from where
+                # this run ended.
+                extra = need - room + overlap
+                try:
+                    history = max(0, cnc.max_backtrack)
+                except (OSError, ValueError):
+                    history = RESUME_STEPS_MAX
+                if extra <= history:
+                    logger.info('the resume needs a %d-byte lead and %d were retraced; '
+                                'retracing %d more', need, room, extra)
+                    try:
+                        cnc.resume(-extra)
+                    except OSError as e:
+                        logger.warning('backtrack of %d ticks refused (%s)', extra, e)
+                    else:
+                        if not self._wait_kernel_idle():
+                            return False, None
+                        further = self._played()
+                        if further is not None:
+                            room += played - further
+                            need = self._lead_bytes(further, lead_min)
+            if need > room:
+                logger.error('the resume needs a %d-byte lead and %d were retraced; '
+                             'the job cannot resume', need, room)
+                return True, None
+            return True, max(room - overlap, need)
+        logger.error('no backtrack the resume could lead out of was run; the job '
+                     'cannot resume')
+        return True, None
+
+    def _played(self):
+        """The payload offset the engine plays next, or None unread. The
+        engine's byte counter is 32 bits wide and wraps past 4 GiB of
+        payload; it is unwrapped against the feeder's count of what the
+        ring took, which stays within one ring of it (behind it by up to a
+        chunk the ring has taken and the feeder has yet to count)."""
         try:
-            cnc.resume(-retraced)
-        except OSError as e:
-            # Not fatal: hold where the decel stopped, and the resume then
-            # brings the laser back on from the start.
-            logger.warning('backtrack refused (%s); holding in place', e)
-            return True, 0
-        if not self._wait_kernel_idle():
-            return False, retraced
-        return True, retraced
+            played = cnc.position.bytes.processed
+        except (OSError, ValueError, AttributeError):
+            return None
+        counted = getattr(self._feeder, 'indexed', 0)
+        if counted:
+            behind = (counted - played) & 0xFFFFFFFF
+            if behind >= 1 << 31:
+                behind -= 1 << 32
+            played = counted - behind
+        return played
 
-    def _resume_retraced(self, retraced: int, overlap: int) -> bool:
-        """Pick the program back up after a retraced hold.
+    def _lead_bytes(self, start, ticks: int) -> int:
+        """Payload bytes a laser-off lead from offset ``start`` must count to
+        last ``ticks`` ticks: from the feeder's count of the job's power
+        bytes; with no count for the window, twice the ticks. The engine
+        plays at most two bytes in one tick (a power byte with the byte
+        after it, or two power bytes, the second dropped), so twice the
+        ticks lasts at least that many ticks whatever the stream."""
+        feeder = self._feeder
+        if feeder is not None and start is not None:
+            length = feeder.lead_bytes(start, ticks)
+            if length is not None:
+                return length
+        return 2 * ticks
 
-        The lead is what was retraced less the overlap, so the beam returns
-        over ground the job already cut. Never zero: zero is the kernel's
-        "forward without re-enabling the laser", which would finish the job
-        dark.
-        """
-        lead = max(1, retraced - overlap)
+    def _resume_retraced(self, lead: int) -> bool:
+        """Pick the program back up after a retraced hold, with the laser
+        off for the ``lead`` _retrace sized."""
         logger.info('resuming (laser lead %d ticks)', lead)
         try:
             cnc.resume(lead)
@@ -1444,20 +1634,23 @@ class Machine(BaseMachine):
           - cooling verdict pulled: latch relocked, the same stop; once
             the verdict permits fire again the latch is unlocked and the
             job waits for a press, as a print paused on the button does;
-          - button press (prints only): pause - stop, backtrack
-            cloud_pause_backtrack_ticks with the laser off, hold; the
-            next press resumes - forward, with the laser re-enabled
-            cloud_pause_backtrack_ticks minus cloud_resume_lead_ticks
-            short of the pause point, so the beam returns over ground
-            the job already cut. A pause in a program's first moments
-            retraces as far as the ring holds and leads by the same
-            amount less. Lid/interlock/cancel while paused cancel the
-            job from where it stands.
-          - a live feed that stops making progress while the ring has
-            room for it: the same stop and retrace, held until the feed
-            moves again, and canceled rather than left standing if it
-            does not. A dry ring is an underrun and a scrapped job; this
-            is the same job with a hidden seam.
+          - button press (prints only): pause - the latch locked, stop,
+            backtrack cloud_pause_backtrack_ticks with the laser off, the
+            latch unlocked, hold; the next press resumes - forward, with
+            the laser re-enabled cloud_pause_backtrack_ticks minus
+            cloud_resume_lead_ticks short of the pause point, so the beam
+            returns over ground the job already cut. The resume's lead
+            clears its acceleration with one ramp interval to spare
+            (_retrace): the backtrack is lengthened to cover that where it
+            falls short, and a pause in a program's first moments, whose
+            history is shorter than that, cancels the job there. Lid/interlock/cancel while
+            paused cancel the job from where it stands.
+          - a live feed that stops making progress for feed_stall_s while
+            the ring has room for it, the job not held on the verdict: the
+            same stop and retrace, held until the feed moves again, and
+            canceled rather than left standing if it does not. A dry ring
+            is an underrun and a scrapped job; this is the same job with
+            a hidden seam.
         The switch thread wakes this loop on every edge, so a reaction
         lands within milliseconds; the level read each pass is the
         backstop for an edge the thread missed.
@@ -1469,6 +1662,16 @@ class Machine(BaseMachine):
         _ring_room_reset()
         logger.info('starting run')
         logger.info('current state: %s' % cnc.state)
+        # The pause keys are read before anything starts: a read that fails
+        # ends the action with the kernel never asked to run.
+        backtrack, lead = self._pause_ticks()
+        # The factory's two constants say one thing: come back on this many
+        # ticks before the point the pause stopped at. Keeping the overlap
+        # rather than the lead is what lets a short retrace stay correct - a
+        # lead longer than the ground retraced would put the beam back on
+        # past the pause point, leaving the cut unburned there. _retrace
+        # sizes each resume's lead from it.
+        overlap = max(0, backtrack - lead)
         if lit:
             # The last look before fire: the press taken with the latch
             # unlocked and nothing locked since, and a verdict that permits
@@ -1495,15 +1698,7 @@ class Machine(BaseMachine):
             wait_time = wait_time - 1
             sleep(.1)
         logger.info('current state: %s' % cnc.state)
-        backtrack = int(_conf_float('cloud_pause_backtrack_ticks', 2000))
-        lead = int(_conf_float('cloud_resume_lead_ticks', 1950))
-        # The factory's two constants say one thing: come back on this many
-        # ticks before the point the pause stopped at. Keeping the overlap
-        # rather than the lead is what lets a short retrace stay correct - a
-        # lead longer than the ground retraced would put the beam back on
-        # past the pause point, leaving the cut unburned there.
-        overlap = max(0, backtrack - lead)
-        retraced = 0
+        resume_lead = 0
         aborted = False
         paused = False
         lamp_now = 'white'
@@ -1515,6 +1710,13 @@ class Machine(BaseMachine):
         feed_held = False
         feed_deadline = 0.0
         feed_holds = 0
+        stall_s = FEED_STALL_S
+        if self._feeder is not None:
+            try:
+                stall_s = feed_stall_s(self._feeder.chunk, cnc.step_freq)
+            except (OSError, ValueError) as e:
+                logger.warning('the step rate cannot be read (%s); a feed stalls '
+                               'after %.0f s', e, stall_s)
         # The cooling verdict: whether the job is held on it, how long it
         # may be, and whether this loop locked the latch on its account.
         verdict_held = False
@@ -1656,11 +1858,14 @@ class Machine(BaseMachine):
                 if go:
                     rearm = False
                     logger.info('cooling verdict clean; resuming')
-                    if not self._resume_retraced(retraced, overlap):
+                    if not self._resume_retraced(resume_lead):
                         self._running_action_cancelled = True
                         aborted = True
                         break
                     verdict_held = False
+                    # The feed made no progress while the job stood held, and
+                    # needed to make none: its watchdog starts over here.
+                    feed_at = monotonic()
                     if pausable:
                         self._fault_clear()
                         send_wss_event(self._q_msg_tx, self.running_action_id,
@@ -1685,8 +1890,13 @@ class Machine(BaseMachine):
                 pos = cnc.position
                 if pos.bytes.processed >= pos.bytes.total:
                     break               # the decel ended the program: done
-                ok, retraced = self._retrace(backtrack)
+                ok, resume_lead = self._retrace(backtrack, overlap)
                 if not ok:
+                    break
+                if resume_lead is None:
+                    logger.error('the held job could not resume safely; canceling it')
+                    self._running_action_cancelled = True
+                    aborted = True
                     break
                 verdict_held = True
                 hold_deadline = monotonic() + hold_max_s
@@ -1722,7 +1932,7 @@ class Machine(BaseMachine):
                     if moved:
                         logger.info('the pulse feed moved again after %d bytes; '
                                     'resuming the job', self._feeder.written)
-                        if not self._resume_retraced(retraced, overlap):
+                        if not self._resume_retraced(resume_lead):
                             self._running_action_cancelled = True
                             aborted = True
                             break
@@ -1742,7 +1952,10 @@ class Machine(BaseMachine):
                         self._running_action_cancelled = True
                         aborted = True
                         break
-                elif not paused and now - feed_at > FEED_STALL_S and _ring_has_room():
+                elif (not paused and not verdict_held and now - feed_at > stall_s
+                      and _ring_has_room()):
+                    # Never while held on the verdict: the engine is idle
+                    # there and cannot run the ring dry.
                     feed_holds += 1
                     logger.error('the pulse feed has not moved in %.0f s with room '
                                  'in the ring (%d bytes fed); stopping the job '
@@ -1762,8 +1975,13 @@ class Machine(BaseMachine):
                     pos = cnc.position
                     if pos.bytes.processed >= pos.bytes.total:
                         break               # the decel ended the program: done
-                    ok, retraced = self._retrace(backtrack)
+                    ok, resume_lead = self._retrace(backtrack, overlap)
                     if not ok:
+                        break
+                    if resume_lead is None:
+                        logger.error('the held job could not resume safely; canceling it')
+                        self._running_action_cancelled = True
+                        aborted = True
                         break
                     feed_held = True
                     feed_deadline = monotonic() + FEED_RECOVER_S
@@ -1801,7 +2019,7 @@ class Machine(BaseMachine):
                     logger.info('button pressed while paused')
                     if lit:
                         self._press_live = True     # taken with the latch unlocked
-                    if not self._resume_retraced(retraced, overlap):
+                    if not self._resume_retraced(resume_lead):
                         self._running_action_cancelled = True
                         aborted = True
                         break
@@ -1815,15 +2033,35 @@ class Machine(BaseMachine):
                     sleep(.05)
                     continue
                 logger.info('button pressed mid-run; pausing')
+                # The stop and the backward run play with the latch locked,
+                # so FIRE stays high-impedance through them whatever the
+                # stop leaves in the engine's output word. The lock spends
+                # the press that paused the job (it sets the hardware's own
+                # button latch), and the latch is unlocked once the retrace
+                # is over and the kernel idle: the resume is one press, taken
+                # from then on, and a press made before it does not count. A
+                # latch the verdict locked stays as the verdict left it.
+                relock = lit and not verdict_latched
+                if relock:
+                    self._latch_lock()
                 cnc.stop()
                 if not self._wait_kernel_idle():
                     break                   # fault: the state read above ends the loop
                 pos = cnc.position
                 if pos.bytes.processed >= pos.bytes.total:
                     break                   # the decel ended the program: done
-                ok, retraced = self._retrace(backtrack)
+                ok, resume_lead = self._retrace(backtrack, overlap)
                 if not ok:
                     break
+                if resume_lead is None:
+                    logger.error('the paused job could not resume safely; canceling it')
+                    self._running_action_cancelled = True
+                    aborted = True
+                    break
+                if relock and not self._latch_unlock():
+                    # The cooling engine holds the latch: the job waits
+                    # paused as a latch the verdict locked does, dark.
+                    verdict_latched = True
                 paused = True
                 send_wss_event(self._q_msg_tx, self.running_action_id,
                                'print:paused')

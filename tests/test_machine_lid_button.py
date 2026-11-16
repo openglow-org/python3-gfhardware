@@ -17,11 +17,14 @@ job that never ends fails at the clock's horizon instead of hanging.
 
 Run:  PYTHONPATH=.:../Glowforge-Utilities python3 -m unittest tests.test_machine_lid_button
 """
+import array
+import bisect
 import errno
 import heapq
 import itertools
 import json
 import importlib.util
+import math
 import os
 import queue
 import sys
@@ -63,6 +66,82 @@ from gfhardware._common import (InputSwitch, MachineState, ButtonColor,   # noqa
 
 # ---------------------------------------------------------------- fakes
 
+RAMP_MIN_HZ, RAMP_INTERVAL_S = 900, 0.01
+_STEP_POSITIONS = {}
+
+
+def step_positions(stream):
+    """The offsets of a stream's step bytes, in order (cached per stream)."""
+    found = _STEP_POSITIONS.get(stream)
+    if found is None:
+        found = _STEP_POSITIONS[stream] = array.array(
+            'q', (i for i, b in enumerate(stream) if b < 0x80))
+    return found
+
+
+def back_ticks(steps, pos, n, waypoint):
+    """Up to n ticks of a backward run from pos (the next forward byte): each
+    tick takes the power bytes below it at no cost and then one step byte
+    (sdma.asm: running backward, do_power never marks the tick). Stops early
+    on the tick that takes the waypoint byte. Returns (pos, ticks, hit), pos
+    None at the dead stop, the job's first byte. ``steps`` is the stream's
+    step_positions, or None for a stream of step bytes only."""
+    if steps is None:
+        first, left = pos - 1, pos                 # step byte offsets are the offsets
+    else:
+        first = bisect.bisect_left(steps, pos) - 1
+        left = first + 1
+    hit_after = None
+    if waypoint is not None and waypoint >= 0:
+        last = waypoint if steps is None else bisect.bisect_right(steps, waypoint) - 1
+        if 0 <= last <= first:
+            hit_after = first - last + 1
+    k = min(n, left) if hit_after is None else min(n, left, hit_after)
+    if k == 0:
+        return None, 0, False
+    pos = first - k + 1 if steps is None else steps[first - k + 1]
+    return pos, k, k == hit_after
+
+
+def backward_end(steps, start, asked, step_freq, ramp_rate):
+    """Where the engine's backward run of ``asked`` bytes from ``start`` ends:
+    it accelerates from 900 Hz by ramp/100 every 10 ms, counts its waypoint
+    per byte, starts the deceleration one interval after the waypoint byte
+    and stops at the update that finds 900 Hz (cnc.c)."""
+    delta = ramp_rate // 100
+    pos, t, freq = start, 0.0, RAMP_MIN_HZ
+    accel, decel = freq < step_freq, False
+    next_upd = RAMP_INTERVAL_S
+    while True:
+        waypoint = None if decel else start - asked
+        n = (math.ceil((next_upd - t) * freq) - 1) if next_upd < math.inf else 1 << 40
+        if n > 0:
+            pos, ticks, hit = back_ticks(steps, pos, n, waypoint)
+            if pos is None:
+                return 0
+            t += ticks / freq
+            if hit:
+                decel, accel = True, False
+                next_upd = t + RAMP_INTERVAL_S
+                continue
+        t += 1.0 / freq                             # the tick that meets the update
+        while t >= next_upd:
+            if decel:
+                if freq <= RAMP_MIN_HZ:
+                    return pos
+                freq = max(RAMP_MIN_HZ, freq - delta)
+            elif accel:
+                freq = min(freq + delta, step_freq)
+                accel = freq < step_freq
+            next_upd = next_upd + RAMP_INTERVAL_S if (accel or decel) else math.inf
+        pos, _, hit = back_ticks(steps, pos, 1, waypoint)
+        if pos is None:
+            return 0
+        if hit:
+            decel, accel = True, False
+            next_upd = t + RAMP_INTERVAL_S
+
+
 class FakeCNC:
     """Kernel wrapper stand-in. state plays: run() -> RUNNING for
     `run_reads` state reads, then IDLE (the program's end); stop() ->
@@ -95,8 +174,10 @@ class FakeCNC:
         # Ring room for the feed watchdog: plenty, unless a test says so.
         self.free = 10 ** 7
         # Steps of played, still-resident program a backward run can walk.
-        # Plenty, unless a test says otherwise.
+        # Plenty, unless a test says otherwise; backtrack_budgets, when a
+        # test sets it, answers the first reads in turn.
         self.backtrack_budget = 10 ** 6
+        self.backtrack_budgets = []
         self.max_backtrack_error = None
         self.resume_error = None
         self.clear_error = None
@@ -108,9 +189,31 @@ class FakeCNC:
         self.fault_after = None
         # The kernel refuses the stop (EPERM in a fault).
         self.stop_error = None
+        # The tick and the stop and resume ramp in force (the print tick and
+        # the kernel's default ramp), and a read of either that fails.
+        self._step_freq = 10000
+        self.ramp_rate = 125000
+        self.step_freq_error = None
+        # The job's bytes by counter value, for the backward run's ticks
+        # (None: step bytes only); each backward run as (from, asked, to);
+        # the run still playing; a position read that fails; and every
+        # unlock made while a backward run still played.
+        self.stream = None
+        self.runs = []
+        self._walking = None
+        self.position_error = None
+        self.unlocked_walking = []
+
+    @property
+    def step_freq(self):
+        if self.step_freq_error is not None:
+            raise self.step_freq_error
+        return self._step_freq
 
     # -- attributes the Machine constructor maps pulse-header keys onto
-    def set_step_freq(self, v): self.writes.append(('step_freq', v))
+    def set_step_freq(self, v):
+        self.writes.append(('step_freq', v))
+        self._step_freq = int(v)
     def set_motor_lock(self, v): self.writes.append(('motor_lock', str(v)))
     def set_x_decay(self, v): pass
     def set_x_current(self, v): pass
@@ -132,13 +235,32 @@ class FakeCNC:
             raise self.stop_error
         self.writes.append(('stop', 1))
         self._state = MachineState.IDLE
+        self._walked()
+
+    def _walked(self):
+        """A backward run is over: the counter reads where it ended."""
+        if self._walking is not None:
+            self.processed, self._walking = self._walking[1], None
 
     def resume(self, steps):
         if self.resume_error is not None:
             raise self.resume_error
+        if self._state is MachineState.RUNNING:
+            raise OSError(errno.EPERM, 'EPERM')     # the kernel starts a run from idle only
         self.writes.append(('resume', int(steps)))
         if steps > 0:
             self.starts.append(('resume', self.hw_latch, self.latch))
+        if steps < 0:
+            # The engine's byte counter steps back over every byte of the
+            # backward run, its deceleration tail included, and reads the
+            # end once the run is over; the history left to walk shrinks by
+            # as much.
+            steps_at = None if self.stream is None else step_positions(self.stream)
+            end = backward_end(steps_at, self.processed, -int(steps),
+                               self._step_freq, self.ramp_rate)
+            self.runs.append((self.processed, -int(steps), end))
+            self._walking = (self.processed, end)
+            self.backtrack_budget = max(0, self.backtrack_budget - (self.processed - end))
         self._state = MachineState.RUNNING
         self._backward = steps < 0
         self._reads_left = self.backtrack_reads if steps < 0 else self.run_reads
@@ -147,6 +269,8 @@ class FakeCNC:
         if not int(v) and self.engine_holds:
             raise OSError(errno.EBUSY, 'the cooling engine holds the latch')
         self.writes.append(('laser_latch', int(v)))
+        if not v and self._walking is not None:
+            self.unlocked_walking.append(self._walking)
         self.latch = int(v)
         if self.latch:
             self.hw_latch = 1
@@ -182,9 +306,11 @@ class FakeCNC:
             self._reads_left -= 1
             if self._reads_left <= 0:
                 self._state = MachineState.IDLE
-                # A backward run ends where it was asked to stop; only a
+                # A backward run ends where its deceleration did; only a
                 # forward one can have played the program out.
-                if not self._backward:
+                if self._backward:
+                    self._walked()
+                else:
                     self.processed = self.total
         return self._state
 
@@ -192,6 +318,8 @@ class FakeCNC:
     def max_backtrack(self):
         if self.max_backtrack_error is not None:
             raise self.max_backtrack_error
+        if self.backtrack_budgets:
+            return self.backtrack_budgets.pop(0)
         return self.backtrack_budget
 
     @property
@@ -199,7 +327,14 @@ class FakeCNC:
         x = AxisPosition(self.xy_steps[0], self.xy_steps[0] / 53.333, 0.0)
         y = AxisPosition(self.xy_steps[1], self.xy_steps[1] / 53.333, 0.0)
         z = AxisPosition(0, 0.0, 0.0)
-        return Position(x, y, z, PulsPosition(self.total, self.processed))
+        processed = self.processed
+        if self._walking is not None:
+            # A backward run still playing: a third of the way to its end.
+            start, end = self._walking
+            processed = start - (start - end) // 3
+        if self.position_error is not None:
+            raise self.position_error
+        return Position(x, y, z, PulsPosition(self.total, processed))
 
 
 class FakeFeeder:
@@ -213,6 +348,12 @@ class FakeFeeder:
         self.finished = finished
         self.error = None
         self.stopped = False
+        # Bytes per write: none here, so a stall is FEED_STALL_S at any tick.
+        self.chunk = 0
+
+    def lead_bytes(self, start, ticks):
+        """No count of the job's power bytes (the client falls back)."""
+        return None
 
     @property
     def written(self):
@@ -483,6 +624,89 @@ def job_events():
     return [e for e in EVENTS if e.startswith('print:')]
 
 
+# A step byte and a power byte of the pulse stream.
+STEP, POWER = 0x01, 0x85
+
+
+def counted_feeder(stream: bytes):
+    """A feeder that has counted ``stream``'s power bytes, as the real one
+    does for every chunk the ring takes."""
+    feeder = machine_mod.PulseFeeder(None, None)
+    feeder._index_power(bytes(stream))
+    return feeder
+
+
+def retrace_on(m, stream, stop, tick, ramp, budget=10 ** 6, feeder=None, acts=None):
+    """A retrace from ``stop`` of a job of ``stream``, at ``tick`` and
+    ``ramp``, with ``budget`` bytes of history (None: no readback): the fake
+    engine plays the job's bytes, the feeder has counted them, and any
+    backward run still playing has ended by the time this returns. ``acts``
+    are on_backward's."""
+    CNC.__init__()
+    vars(CNC).pop('resume', None)
+    CNC._step_freq, CNC.ramp_rate, CNC.backtrack_reads = tick, ramp, 1
+    if budget is None:
+        CNC.max_backtrack_error = OSError(errno.ENOENT, 'ENOENT')
+    else:
+        CNC.backtrack_budget = budget
+    CNC.processed, CNC.total, CNC.stream = stop, 10 ** 6, stream
+    m._feeder = feeder or counted_feeder(stream)
+    if acts:
+        on_backward(acts)
+    try:
+        ok, lead = m._retrace(2000, 50)
+    finally:
+        vars(CNC).pop('resume', None)
+    CNC._walked()
+    return ok, lead
+
+
+def on_backward(acts):
+    """Make the fake kernel's backward runs go wrong, by their order: acts
+    maps 1 (the first run) or 2 (the extra run) to 'refuse' (EPERM, no run),
+    'blind' (the counter unreadable from the run on), 'see' (readable again)
+    or 'fault' (the engine faults during the run)."""
+    resume, count = CNC.resume, [0]
+
+    def wrapped(steps):
+        if steps < 0:
+            count[0] += 1
+        act = acts.get(count[0]) if steps < 0 else None
+        if act == 'refuse':
+            raise OSError(errno.EPERM, 'EPERM')
+        resume(steps)
+        if act == 'blind':
+            CNC.position_error = OSError(errno.EIO, 'EIO')
+        elif act == 'see':
+            CNC.position_error = None
+        elif act == 'fault':
+            CNC.fault_after = 1
+    CNC.resume = wrapped
+
+
+def misjudged(m, stream, tick, ramp, lead, overlap=50):
+    """What is wrong with a resume's lead, judged on where the fake engine's
+    backward runs really ended, or None. Its step bytes cover the minimum;
+    the beam comes back on the overlap before where a lead of everything the
+    first run retraced would end, or later where the window needs it, never
+    past that point; an extra run asks for the shortfall on the first run's
+    window and the overlap; there is never a third."""
+    least = machine_mod.resume_lead_min(tick, ramp)
+    _, asked, first_end = CNC.runs[0]
+    bound = first_end + asked
+    start = CNC.processed
+    if lead - stream.count(bytes([POWER]), start, start + lead) < least:
+        return 'short'
+    if start + lead > bound:
+        return 'late'
+    if start + lead != max(bound - overlap, start + m._feeder.lead_bytes(start, least)):
+        return 'not the overlap before that, or the need'
+    if len(CNC.runs) == 2:
+        shortfall = m._feeder.lead_bytes(first_end, least) - asked
+        return None if CNC.runs[1][1] == shortfall + overlap else 'extra run missized'
+    return None if len(CNC.runs) == 1 else 'more than one extra run'
+
+
 def make_machine():
     m = Machine()
     m.running_action_id = 42
@@ -696,6 +920,7 @@ class RunLoopTests(unittest.TestCase):
             error = OSError(5, 'I/O error')
             finished = False
             written = 0
+            chunk = 0
 
             def stop(self, timeout=5.0):
                 pass
@@ -754,11 +979,13 @@ class RunLoopTests(unittest.TestCase):
 
     def test_pause_at_program_end_finishes(self):
         # The decel lands on the program's last byte: no backtrack, done.
-        SW.press(delay=0.05)
+        # Machine time keeps the program's end ahead of the press.
+        clock = MachineClock(self, self.m)
 
         def end_it():
             CNC.processed = CNC.total
-        threading.Timer(0.049, end_it).start()
+        clock.at(0.049, end_it)
+        clock.press(0.05)
         aborted = self.m._run_loop(pausable=True)
         self.assertFalse(aborted)
         self.assertNotIn(('resume', -2000), CNC.writes)
@@ -767,41 +994,230 @@ class RunLoopTests(unittest.TestCase):
     def test_the_retrace_walks_what_the_ring_holds_and_leads_by_it(self):
         # With the factory distances (2000 back, a 1950 lead: a 50-tick
         # overlap), each row is what the ring offers and the writes the
-        # retrace and the resume make. A refused backtrack holds where the
-        # decel stopped and resumes with the shortest lead, because nothing
-        # was retraced: a lead over ground not yet cut would leave it
-        # unburned, and a lead of zero is the kernel's "no laser at all". A
-        # short history shortens the retrace and the lead with it. No
-        # history asks for no backward run. No readback asks for the
-        # configured distance and lets the kernel refuse it.
-        def refuse_backward():
-            orig = CNC.resume
+        # retrace and the resume make. The lead clears the resume's
+        # acceleration with one ramp interval to spare: 424 + 100 ticks at
+        # 10 kHz and the default ramp, 3091 + 282 at a 28160 Hz print tick,
+        # where the backtrack is lengthened to cover it. A short history
+        # shortens the retrace and the lead with it, down to that minimum;
+        # shorter than the minimum, or a backtrack refused, on both reads of
+        # the history, or a tick that cannot be read, and there is no resume
+        # (None: the job is canceled at the pause). A short read or a
+        # refusal reads the history again and asks once more. No readback
+        # asks for the distance the lead needs, at any tick, and lets the
+        # kernel refuse it. The job here holds no power bytes, so the lead's
+        # bytes are its ticks; with no count of them, the lead is twice the
+        # ticks (the engine plays at most two bytes in one tick), and a
+        # history of 1000 is too short at 10 kHz.
+        def no_count():
+            self.m._feeder = None
+            CNC.backtrack_budget = 1000
 
-            def resume(steps):
-                if steps < 0:
-                    raise OSError(1, 'EPERM')
-                orig(steps)
-            CNC.resume = resume
+        def no_readback_at_28160():
+            CNC._step_freq = 28160
+            CNC.max_backtrack_error = OSError(2, 'ENOENT')
+
+        def refuse_backward(times):
+            def arrange():
+                orig = CNC.resume
+                left = [times]
+
+                def resume(steps):
+                    if steps < 0 and left[0] > 0:
+                        left[0] -= 1
+                        raise OSError(1, 'EPERM')
+                    orig(steps)
+                CNC.resume = resume
+            return arrange
         rows = (
-            ('backtrack refused', refuse_backward, [('resume', 1)]),
-            ('short history', lambda: setattr(CNC, 'backtrack_budget', 500),
-             [('resume', -500), ('resume', 450)]),
-            ('no history', lambda: setattr(CNC, 'backtrack_budget', 0), [('resume', 1)]),
+            ('backtrack refused twice', refuse_backward(2), []),
+            ('backtrack refused once', refuse_backward(1),
+             [('resume', -2000), ('resume', 1950)]),
+            ('short history', lambda: setattr(CNC, 'backtrack_budget', 560),
+             [('resume', -560), ('resume', 524)]),
+            ('history shorter than the minimum', lambda: setattr(CNC, 'backtrack_budget', 523),
+             []),
+            ('no history', lambda: setattr(CNC, 'backtrack_budget', 0), []),
+            ('history read short once', lambda: setattr(CNC, 'backtrack_budgets', [0]),
+             [('resume', -2000), ('resume', 1950)]),
             ('no readback', lambda: setattr(CNC, 'max_backtrack_error', OSError(2, 'ENOENT')),
              [('resume', -2000), ('resume', 1950)]),
+            ('a 28160 Hz print', lambda: setattr(CNC, '_step_freq', 28160),
+             [('resume', -3423), ('resume', 3373)]),
+            ('no readback at a 28160 Hz print', no_readback_at_28160,
+             [('resume', -3423), ('resume', 3373)]),
+            ('no tick', lambda: setattr(CNC, 'step_freq_error', OSError(5, 'EIO')), []),
+            ('no power-byte count', no_count, []),
         )
+        self.addCleanup(setattr, self.m, '_feeder', None)
         try:
             for name, arrange, writes in rows:
                 with self.subTest(name):
                     CNC.__init__()
+                    CNC.processed, CNC.total = 50000, 10 ** 6
+                    self.m._feeder = counted_feeder(bytes([STEP]) * 100000)
                     vars(CNC).pop('resume', None)
                     arrange()
-                    ok, retraced = self.m._retrace(2000)
+                    ok, lead = self.m._retrace(2000, 50)
                     self.assertTrue(ok)
-                    self.assertTrue(self.m._resume_retraced(retraced, 50))
+                    if lead is not None:
+                        self.assertTrue(self.m._resume_retraced(lead))
                     self.assertEqual(CNC.writes, writes)
+                    self.assertEqual(lead is None, not writes)
         finally:
             vars(CNC).pop('resume', None)
+
+    def test_a_power_dense_lead_holds_its_ticks_in_step_bytes(self):
+        # A raster stream as dense in power bytes as the count allows for:
+        # 128 of every 256 bytes, ahead of the step bytes. The kernel counts
+        # the lead in bytes, and the step bytes in the window the resume
+        # plays must cover the minimum in ticks, at the captured Plus tick
+        # and at the ramps the GRBL controller leaves (x16, x32). The beam
+        # comes back on the overlap before where a lead of everything the
+        # first backward run retraced would end, or later where the window
+        # needs it, never past that point; so also with only just enough
+        # history. The window is the one the resume plays: from where the
+        # engine's backward run ended, its deceleration tail timed as the
+        # engine plays it (retrace_on). Thirty power bytes just inside that
+        # window lengthen the lead past what was retraced less the overlap.
+        # Where the window needs more than was retraced (dense until 3500
+        # bytes before the stop), one more backward run makes the room:
+        # with no history readback too, and with just the history it
+        # needs, but not with a byte less. Past 4 GiB of payload the
+        # engine's 32-bit counter has wrapped, and the window is the job's
+        # own: an index emulated without 4 GiB of data, dense past the wrap
+        # and sparse below it.
+        dense = (bytes([POWER]) * 128 + bytes([STEP]) * 128) * 800
+        at = 102436
+        tick = 28160
+        cluster = (bytes([STEP]) * (at - 6767) + bytes([POWER]) * 30
+                   + bytes([STEP]) * 100000)
+        extra = dense[:at - 3500] + bytes([STEP]) * 100000
+        self.addCleanup(setattr, self.m, '_feeder', None)
+
+        def probe(stream):
+            """The backward runs a retrace with plenty of history makes."""
+            retrace_on(self.m, stream, at, tick, 125000)
+            return list(CNC.runs)
+        single, double = probe(dense), probe(extra)
+        self.assertEqual((len(single), len(double)), (1, 2))
+        walked = double[0][0] - double[0][2]
+        for name, stream, ramp, budget, runs in (
+                ('the default ramp', dense, 125000, 10 ** 6, 1),
+                ('the x16 GRBL ramp', dense, 250000, 10 ** 6, 1),
+                ('the x32 GRBL ramp', dense, 500000, 10 ** 6, 1),
+                ('just enough history', dense, 125000, single[0][1], 1),
+                ("power bytes just inside the resume's window", cluster, 125000, 10 ** 6, 1),
+                ("the resume's window denser than the stop's", extra, 125000, 10 ** 6, 2),
+                ('no history readback', extra, 125000, None, 2),
+                ('just the history the extra run needs', extra, 125000,
+                 walked + double[1][1], 2)):
+            with self.subTest(name):
+                ok, lead = retrace_on(self.m, stream, at, tick, ramp, budget)
+                self.assertTrue(ok)
+                self.assertIsNotNone(lead)
+                self.assertIsNone(misjudged(self.m, stream, tick, ramp, lead))
+                self.assertEqual(len(CNC.runs), runs)
+        with self.subTest('a byte less history than that'):
+            ok, lead = retrace_on(self.m, extra, at, tick, 125000, walked + double[1][1] - 1)
+            self.assertTrue(ok)
+            self.assertIsNone(lead)
+            self.assertEqual([w[0] for w in CNC.writes], ['resume'])
+            self.assertLess(CNC.writes[0][1], 0)             # the backward run, no resume
+
+        class DenseFrom:
+            """A count of power bytes per block: 128 from block ``first`` on."""
+            def __init__(self, first):
+                self.first = first
+
+            def __getitem__(self, block):
+                return 128 if block >= self.first else 0
+        with self.subTest('past 4 GiB of payload'):
+            wrap = 1 << 32
+            CNC.__init__()
+            CNC._step_freq, CNC.processed, CNC.total = tick, at, 10 ** 6   # job at wrap + at
+            CNC.stream = dense             # the bytes by counter value: the same phase
+            feeder = counted_feeder(b'')
+            feeder._power_counts = DenseFrom(wrap // 256)
+            self.m._feeder = feeder
+            # The engine 100 bytes into a chunk the ring took and the
+            # feeder has yet to count, and the usual way round.
+            feeder._indexed = wrap + at - 100
+            self.assertEqual(self.m._played(), wrap + at)
+            feeder._indexed = wrap + 2 * at
+            self.assertEqual(self.m._played(), wrap + at)
+            ok, lead = self.m._retrace(2000, 50)
+            CNC._walked()
+            self.assertTrue(ok)
+            self.assertIsNotNone(lead)
+            start = wrap + CNC.processed
+            steps = sum(1 for x in range(start, start + lead) if x % 256 >= 128)
+            self.assertGreaterEqual(steps, machine_mod.resume_lead_min(tick, 125000))
+
+    def test_a_dense_raster_resumes_from_every_stop_phase(self):
+        # The lead a window needs swings with where in a raster's 256-byte
+        # period it starts, and the resume's window starts where the
+        # engine's backward run ended, a deceleration tail behind the one
+        # the retrace was sized on (and longer over power bytes, which a
+        # backward run plays at no tick). Where that window needs more than
+        # was retraced, one more backward run, for the shortfall and the
+        # overlap, makes the room: from each of the 256 stop phases of a
+        # raster with half its bytes power bytes, at 28160 Hz at the default
+        # ramp and the GRBL ramps, and at 10 kHz, the job resumes, judged on
+        # where the engine's runs ended (misjudged). One extra run at most:
+        # where the window it leaves is still short (three power bytes in
+        # four, behind a sparse stretch), the job is canceled at the pause.
+        dense = (bytes([POWER]) * 128 + bytes([STEP]) * 128) * 800
+        feeder = counted_feeder(dense)
+        self.addCleanup(setattr, self.m, '_feeder', None)
+        failed = {}
+        for tick, ramp in ((28160, 125000), (28160, 250000), (28160, 500000), (10000, 125000)):
+            for stop in range(102400, 102400 + 256):
+                ok, lead = retrace_on(self.m, dense, stop, tick, ramp, feeder=feeder)
+                why = ('canceled' if not ok or lead is None
+                       else misjudged(self.m, dense, tick, ramp, lead))
+                if why:
+                    failed.setdefault((tick, ramp, why), []).append(stop % 256)
+        with self.subTest('every stop phase'):
+            self.assertEqual({k: len(v) for k, v in failed.items()}, {})
+        with self.subTest('still short after one extra run'):
+            three = (bytes([POWER]) * 192 + bytes([STEP]) * 64) * 800
+            ok, lead = retrace_on(self.m, three[:102436 - 5100] + bytes([STEP]) * 100000,
+                                  102436, 28160, 125000)
+            self.assertTrue(ok)
+            self.assertIsNone(lead)
+            self.assertEqual([kind for kind, _ in CNC.writes], ['resume', 'resume'])
+            self.assertTrue(all(n < 0 for _, n in CNC.writes))   # two backward runs
+
+    def test_a_pause_key_outside_the_panels_range_takes_its_default(self):
+        # forgectrl's settings take 500 to 30000 for both keys and show any
+        # other stored value, a non-number included, as unset; the client
+        # runs with the default then.
+        conf = machine_mod._conf_float
+        self.addCleanup(setattr, machine_mod, '_conf_float', conf)
+        for stored, ticks in (({'cloud_pause_backtrack_ticks': 499,
+                                'cloud_resume_lead_ticks': 30001}, (2000, 1950)),
+                              ({'cloud_pause_backtrack_ticks': 500,
+                                'cloud_resume_lead_ticks': 30000}, (500, 30000)),
+                              ({'cloud_pause_backtrack_ticks': float('nan'),
+                                'cloud_resume_lead_ticks': float('inf')}, (2000, 1950))):
+            with self.subTest(stored=stored):
+                machine_mod._conf_float = lambda key, default: stored.get(key, default)
+                self.assertEqual(self.m._pause_ticks(), ticks)
+
+    def test_a_pause_key_that_cannot_be_read_starts_nothing(self):
+        # The keys are read before the run: a read that raises ends the
+        # action with the kernel never asked to run.
+        conf = machine_mod._conf_float
+        self.addCleanup(setattr, machine_mod, '_conf_float', conf)
+
+        def unreadable(key, default):
+            if key.startswith('cloud_'):
+                raise ValueError(key)
+            return conf(key, default)
+        machine_mod._conf_float = unreadable
+        with self.assertRaises(ValueError):
+            self.m._run_loop(pausable=True)
+        self.assertNotIn(('run', 1), CNC.writes)
 
 
 class ButtonWaitTests(unittest.TestCase):
@@ -1160,6 +1576,24 @@ class FeedWatchdogTests(unittest.TestCase):
         CNC.free = 0
         CNC.run_reads = 12                          # the program ends on its own
         self.m._feeder = FakeFeeder(written=1000)
+
+        aborted = self.m._run_loop(pausable=True)
+
+        self.assertFalse(aborted)
+        self.assertNotIn(('stop', 1), CNC.writes)
+        self.assertEqual(job_events(), [])
+
+    def test_a_slow_print_tick_is_not_a_stalled_feed(self):
+        # At a 1 kHz print tick one 256 KiB chunk takes 262 s to drain, so a
+        # healthy feeder shows no progress for that long with room appearing
+        # in the ring. The watchdog waits out the chunk's drain time, not
+        # FEED_STALL_S: 100 s of no progress here is no hold.
+        CNC._step_freq = 1000
+        feeder = FakeFeeder(written=1000)
+        feeder.chunk = machine_mod.FEED_CHUNK
+        self.m._feeder = feeder
+        clock = MachineClock(self, self.m, horizon=110.0)
+        clock.at(100.0, lambda: setattr(CNC, '_reads_left', 1))
 
         aborted = self.m._run_loop(pausable=True)
 
@@ -2669,20 +3103,250 @@ class VerdictHoldTests(unittest.TestCase):
             vars(CNC).pop('resume', None)
 
     def test_the_button_does_not_resume_under_a_hold(self):
+        # Paused at 0.05; the engine holds from 0.20 (fire refused with it,
+        # as it publishes every hold); the press at 0.40 resumes nothing.
+        # Released at 0.70, the job waits unlocked for a press, and the one
+        # at 0.90 resumes it.
         clock = MachineClock(self, self.m)
+        resumed_before = []
         clock.press(0.05)                            # pause
-        clock.at(0.20, lambda: setattr(COOL, '_hold', True))
+        clock.at(0.20, lambda: setattr(COOL, '_fire_ok', False))
         clock.press(0.40)                            # a resume the engine forbids
         clock.at(0.70, self._release)
-        clock.at(1.00, lambda: setattr(CNC, '_reads_left', 1))
+        clock.at(0.85, lambda: resumed_before.append(('resume', 1950) in CNC.writes))
+        clock.press(0.90)
+        clock.at(1.20, lambda: setattr(CNC, '_reads_left', 1))
         aborted = self._run()
         self.assertFalse(aborted)
+        self.assertEqual(resumed_before, [False])
         w = CNC.writes
         self.assertEqual(w.count(('resume', 1950)), 1)
         self.assertEqual(w.count(('resume', -2000)), 1)
-        # The hold never locked the latch, so the press that paused the job
-        # was the last one needed: the resume starts with it cleared.
         self.assertEqual(CNC.starts[-1], ('resume', 0, 0))
+
+    def test_a_button_pause_retraces_locked_and_resumes_on_one_press_after_it(self):
+        # The pause at 0.05 locks the latch before its stop and unlocks it
+        # once the backward run is over; a press made while it retraces
+        # (0.06) does not count, and the one at 0.50 resumes, with the
+        # hardware's latch cleared by it.
+        clock = MachineClock(self, self.m)
+        resumed_at = []
+        resume = CNC.resume
+
+        def note_resume(steps):
+            resume(steps)
+            if steps > 0:
+                resumed_at.append(round(clock.elapsed, 2))
+        CNC.resume = note_resume
+        self.addCleanup(vars(CNC).pop, 'resume', None)
+        clock.press(0.05)                            # pause
+        clock.press(0.06)                            # inside the stop and the retrace
+        clock.press(0.50)                            # resume
+        clock.at(0.80, lambda: setattr(CNC, '_reads_left', 1))
+        aborted = self._run()
+        self.assertFalse(aborted)
+        w = CNC.writes
+        locked, back, unlocked = (w.index(('laser_latch', 1)), w.index(('resume', -2000)),
+                                  w.index(('laser_latch', 0)))
+        self.assertLess(locked, w.index(('stop', 1)))
+        self.assertLess(locked, back)
+        self.assertLess(back, unlocked)
+        self.assertLess(unlocked, w.index(('resume', 1950)))
+        self.assertEqual(len(resumed_at), 1)
+        self.assertGreaterEqual(resumed_at[0], 0.50)
+        self.assertEqual(CNC.starts[-1], ('resume', 0, 0))
+        self.assertEqual([e for e in job_events() if e in ('print:paused', 'print:resumed')],
+                         ['print:paused', 'print:resumed'])
+
+    def _job_that_retraces_twice(self):
+        """A 28160 Hz print paused where its resume window needs one more
+        backward run: dense until 3500 bytes before the stop."""
+        at = 102436
+        stream = (bytes([POWER]) * 128 + bytes([STEP]) * 128) * 800
+        stream = stream[:at - 3500] + bytes([STEP]) * 100000
+        CNC._step_freq, CNC.processed, CNC.total, CNC.stream = 28160, at, 10 ** 6, stream
+        self.m._feeder = counted_feeder(stream)
+        self.addCleanup(setattr, self.m, '_feeder', None)
+        self.addCleanup(vars(CNC).pop, 'resume', None)
+        return stream
+
+    def test_a_button_pause_that_retraces_twice_unlocks_after_both_runs(self):
+        # Both backward runs play locked, and both are over before the
+        # unlock; the press after it resumes.
+        self._job_that_retraces_twice()
+        clock = MachineClock(self, self.m)
+        clock.press(0.05)                            # pause
+        clock.press(0.50)                            # resume
+        clock.at(0.80, lambda: setattr(CNC, '_reads_left', 1))
+        aborted = self._run()
+        self.assertFalse(aborted)
+        w = CNC.writes
+        back = [i for i, x in enumerate(w) if x[0] == 'resume' and x[1] < 0]
+        forward = [i for i, x in enumerate(w) if x[0] == 'resume' and x[1] > 0]
+        locked, stopped, unlocked = (w.index(('laser_latch', 1)), w.index(('stop', 1)),
+                                     w.index(('laser_latch', 0)))
+        self.assertEqual(len(back), 2)
+        self.assertLess(locked, stopped)
+        self.assertLess(stopped, back[0])
+        self.assertLess(back[1], unlocked)
+        self.assertLess(unlocked, forward[0])
+        self.assertEqual(CNC.unlocked_walking, [])
+
+    def test_an_extra_run_that_fails_never_resumes(self):
+        # A feed hold retraces, the latch still unlocked, a job whose resume
+        # window needs one more backward run. That run refused, or the
+        # engine's counter unreadable after the first run or after the
+        # extra one: the job is canceled there, never resumed, and the run
+        # loop's closing lock leaves the latch locked. A fault during the
+        # extra run is the kernel's fault, not a cancel.
+        stream = self._job_that_retraces_twice()
+        with self.subTest('a fault during the extra run'):
+            ok, lead = retrace_on(self.m, stream, CNC.processed, 28160, 125000,
+                                  acts={2: 'fault'})
+            self.assertFalse(ok)
+            self.assertIsNone(lead)
+        for name, acts, runs in (('the extra run refused', {2: 'refuse'}, 1),
+                                 ('the counter unreadable after the first run',
+                                  {1: 'blind', 2: 'see'}, 1),
+                                 ('the counter unreadable after the extra run',
+                                  {2: 'blind'}, 2)):
+            with self.subTest(name):
+                CNC.__init__()
+                COOL.__init__()
+                COOL.armed = True
+                del EVENTS[:]
+                self.m = make_machine()
+                SW.handler = self.m._switch_event
+                self._job_that_retraces_twice()
+                on_backward(acts)
+                MachineClock(self, self.m, horizon=60.0)
+                aborted = self._run()
+                self.assertTrue(aborted)
+                self.assertTrue(self.m._running_action_cancelled)
+                self.assertEqual(len([x for x in CNC.writes if x[0] == 'resume' and x[1] < 0]),
+                                 runs)
+                self.assertFalse([x for x in CNC.writes if x[0] == 'resume' and x[1] > 0])
+                self.assertEqual(CNC.latch, 1)
+
+    def test_a_press_counted_while_the_unlock_is_on_its_way_does_not_resume(self):
+        # The pause's unlock: a press lands while the lock still holds (the
+        # hardware ignores it) but is counted by the switch thread. It is
+        # dropped once the unlock is through; the press at 0.50 resumes, with
+        # the hardware's latch cleared by it.
+        clock = MachineClock(self, self.m)
+        latch = CNC.laser_latch
+        on_the_way = []
+
+        def unlock_with_a_press(v):
+            if v == 0 and not on_the_way:
+                on_the_way.append(clock.elapsed)
+                SW._edge(InputSwitch.SW_BUTTON, True)
+                SW._edge(InputSwitch.SW_BUTTON, False)
+            latch(v)
+        CNC.laser_latch = unlock_with_a_press
+        self.addCleanup(vars(CNC).pop, 'laser_latch', None)
+        clock.press(0.05)                            # pause
+        clock.press(0.50)                            # resume
+        clock.at(0.80, lambda: setattr(CNC, '_reads_left', 1))
+        aborted = self._run()
+        self.assertFalse(aborted)
+        self.assertEqual(len(on_the_way), 1)
+        self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)])
+
+    def test_a_pause_whose_unlock_the_engine_refuses_waits_locked_for_its_release(self):
+        # The cooling engine takes its own hold at the pause's lock, so the
+        # unlock after the retrace is refused (EBUSY): the job waits locked
+        # and dark, and the press at 0.40 resumes nothing. Released at 0.70,
+        # the unlock takes, the button breathes, and the press at 1.00
+        # resumes it with the hardware's latch cleared.
+        clock = MachineClock(self, self.m)
+        del LEDS.button_colors[:]
+        latch = CNC.laser_latch
+        holds = []
+
+        def engine_holds_from_the_lock(v):
+            if int(v) == 0 and holds and holds[-1]:
+                raise OSError(errno.EBUSY, 'the cooling engine holds the latch')
+            latch(v)
+            if int(v) and not holds:
+                holds.append(True)
+        CNC.laser_latch = engine_holds_from_the_lock
+        self.addCleanup(vars(CNC).pop, 'laser_latch', None)
+        mid = []
+        clock.press(0.05)                            # the pause
+        clock.press(0.40)                            # under the engine's hold
+        clock.at(0.60, lambda: mid.append((CNC.latch, 'breathe' in LEDS.button_colors,
+                                           [s for s in CNC.starts if s[0] == 'resume'])))
+        clock.at(0.70, lambda: holds.append(False))
+        clock.press(1.00)                            # the resume
+        clock.at(1.30, lambda: setattr(CNC, '_reads_left', 1))
+        aborted = self._run()
+        self.assertEqual(mid, [(1, False, [])], 'locked, dark, not resumed under the engine hold')
+        self.assertFalse(aborted)
+        self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)])
+
+    def test_a_pause_or_hold_too_early_to_lead_out_of_the_ramp_cancels_the_job_there(self):
+        # The ring holds less history than the resume's acceleration and its
+        # margin (524 ticks at 10 kHz): the button's pause, the engine's hold and the
+        # feed's hold each cancel the job at the stop, with no backward run
+        # and no resume, and the kernel left idle with the latch locked.
+        fs = machine_mod.FEED_STALL_S
+        self.addCleanup(setattr, machine_mod, 'FEED_STALL_S', fs)
+        rows = (
+            ('button', lambda clock: clock.press(0.05), None),
+            ('verdict', lambda clock: clock.at(0.05, lambda: setattr(COOL, '_fire_ok', False)), None),
+            ('feed', lambda clock: None, FakeFeeder(written=100)),
+        )
+        for name, arrange, feeder in rows:
+            with self.subTest(name):
+                CNC.__init__()
+                COOL.__init__()
+                COOL.armed = True
+                del EVENTS[:]
+                self.m = make_machine()
+                SW.handler = self.m._switch_event
+                machine_mod.FEED_STALL_S = 0.1
+                self.m._feeder = feeder
+                CNC.backtrack_budget = 300
+                clock = MachineClock(self, self.m, horizon=5.0)
+                arrange(clock)
+                aborted = self._run()
+                self.m._feeder = None
+                self.assertTrue(aborted)
+                self.assertTrue(self.m._running_action_cancelled)
+                self.assertFalse([x for x in CNC.writes if x[0] == 'resume'])
+                self.assertIs(CNC.state, machine_mod.MachineState.IDLE)
+                self.assertEqual(CNC.latch, 1)
+
+    def test_a_stalled_feed_under_a_verdict_hold_is_not_a_second_hold(self):
+        # A live feed wedged from the start, a verdict hold at 5 s cleared at
+        # 50 s, the press that resumes at 55 s: the watchdog leaves the held
+        # job alone (one retrace for the hold) and starts over at the
+        # resume, so the press at 65 s pauses the job, and the lid at 70 s
+        # ends it with the kernel idle.
+        self.m._feeder = FakeFeeder(written=100)
+        clock = MachineClock(self, self.m, horizon=80.0)
+        retraced_at = []
+        resume = CNC.resume
+
+        def note_retrace(steps):
+            resume(steps)
+            if steps < 0:
+                retraced_at.append(int(clock.elapsed))
+        CNC.resume = note_retrace
+        self.addCleanup(vars(CNC).pop, 'resume', None)
+        clock.at(5.0, lambda: setattr(COOL, '_fire_ok', False))
+        clock.at(50.0, self._release)
+        clock.press(55.0)
+        clock.press(65.0)
+        clock.at(70.0, lambda: (SW._edge(InputSwitch.SW_DOORS, False),
+                                SW._edge(InputSwitch.SW_DOOR1, False)))
+        aborted = self._run()
+        self.m._feeder = None
+        self.assertTrue(aborted)
+        self.assertEqual(retraced_at, [5, 65])               # the hold's, the pause's
+        self.assertEqual(CNC.writes.count(('resume', 1950)), 1)
+        self.assertIs(CNC.state, machine_mod.MachineState.IDLE)
 
     def test_an_engine_stop_short_of_the_program_is_not_a_finish(self):
         # A fail tier (FIRE, CRASH) stops the kernel itself: idle, short of
