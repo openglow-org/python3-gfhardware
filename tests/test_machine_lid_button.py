@@ -17,6 +17,7 @@ job that never ends fails at the clock's horizon instead of hanging.
 
 Run:  PYTHONPATH=.:../Glowforge-Utilities python3 -m unittest tests.test_machine_lid_button
 """
+import errno
 import heapq
 import itertools
 import json
@@ -87,6 +88,9 @@ class FakeCNC:
         self.total = 1000
         self.latch = 1
         self.hw_latch = 1
+        # The cooling engine holds its own lock: the kernel refuses an
+        # unlock (EBUSY) and nothing changes.
+        self.engine_holds = False
         self.starts = []
         # Ring room for the feed watchdog: plenty, unless a test says so.
         self.free = 10 ** 7
@@ -140,6 +144,8 @@ class FakeCNC:
         self._reads_left = self.backtrack_reads if steps < 0 else self.run_reads
 
     def laser_latch(self, v):
+        if not int(v) and self.engine_holds:
+            raise OSError(errno.EBUSY, 'the cooling engine holds the latch')
         self.writes.append(('laser_latch', int(v)))
         self.latch = int(v)
         if self.latch:
@@ -1781,6 +1787,21 @@ class FeederExitTests(unittest.TestCase):
         self.assertLess(EVENTS.index('button:pressed'), EVENTS.index('print:warmup:starting'),
                         'the warm-up is announced after the press')
 
+    def test_an_unlock_the_cooling_engine_refuses_cancels_the_print_and_asks_for_no_press(self):
+        # The engine locked its own hold after the verdict was read: the
+        # kernel refuses the unlock and nothing changed, so the print ends
+        # without the button ever asking for a press that could not count.
+        self._lamp_into_the_writes()
+        self.m._button_timeout_s = lambda: 0.2   # a press asked for would end here
+        CNC.engine_holds = True
+        COOL.set_armed(True)
+        self.m._arm_for_the_press(self._print())
+        self.assertTrue(self.m._running_action_cancelled)
+        self.assertNotIn(('lamp', 'breathe'), CNC.writes)
+        self.assertNotIn(('laser_latch', 0), CNC.writes)
+        self.assertEqual(CNC.latch, 1)
+        self.assertFalse(COOL.armed)
+
     def test_a_press_before_the_unlock_does_not_count(self):
         # The session opens under a hold: the latch stays locked, the button
         # dark, and a press then is not the job's press. The hold clears at
@@ -2166,6 +2187,50 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertEqual([e for e in job_events() if e in ('print:paused', 'print:resumed')],
                          ['print:paused', 'print:resumed'])
 
+    def test_a_relock_the_cooling_engine_still_holds_asks_for_no_press_until_it_releases(self):
+        # The verdict clears while the engine still holds its own lock: the
+        # kernel refuses the unlock, so the job stays held, locked, with the
+        # button dark. Once the engine releases, the unlock takes, the
+        # button breathes, and the press resumes it.
+        clock = MachineClock(self, self.m)
+        del LEDS.button_colors[:]
+        held = []
+        clock.at(0.05, lambda: (setattr(COOL, '_fire_ok', False), setattr(CNC, 'engine_holds', True)))
+        clock.at(0.30, self._release)
+        clock.at(0.60, lambda: held.append((CNC.latch, 'breathe' in LEDS.button_colors,
+                                            ('resume', 1950) in CNC.writes)))
+        clock.at(0.70, lambda: setattr(CNC, 'engine_holds', False))
+        clock.press(1.00)
+        clock.at(1.30, lambda: setattr(CNC, '_reads_left', 1))
+        with self.assertLogs(machine_mod.logger, 'WARNING') as logs:
+            aborted = self._run()
+        self.assertEqual(held, [(1, False, False)], 'locked, dark and held while the engine holds')
+        self.assertEqual(len([r for r in logs.records if r.funcName == '_latch_unlock']), 1,
+                         'the run of refused unlocks is named once')
+        self.assertFalse(aborted)
+        self.assertFalse(self.m._running_action_cancelled)
+        self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)],
+                         'the press after the release resumes it, with the hardware latch cleared')
+
+    def test_a_second_run_of_refused_unlocks_is_named_again(self):
+        # Two holds, each with the engine holding its own lock while the
+        # verdict clears, each ended by the engine's release and a press:
+        # each run of refusals is named, the second after an unlock that took.
+        clock = MachineClock(self, self.m)
+        for t in (0.05, 1.05):
+            clock.at(t, lambda: (setattr(COOL, '_fire_ok', False), setattr(COOL, '_hold', True),
+                                 setattr(CNC, 'engine_holds', True)))
+            clock.at(t + 0.25, self._release)
+            clock.at(t + 0.45, lambda: setattr(CNC, 'engine_holds', False))
+            clock.press(t + 0.70)
+        clock.at(2.30, lambda: setattr(CNC, '_reads_left', 1))
+        with self.assertLogs(machine_mod.logger, 'WARNING') as logs:
+            aborted = self._run()
+        self.assertFalse(aborted)
+        self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)] * 2)
+        self.assertEqual(len([r for r in logs.records if r.funcName == '_latch_unlock']), 2,
+                         'each run of refused unlocks is named')
+
     def test_the_wait_for_the_press_after_a_relock_has_no_clock_of_its_own(self):
         # Verdict clean and the latch unlocked: the print is where a print
         # paused on the button is, and waits as that one does. Neither the
@@ -2268,6 +2333,30 @@ class VerdictHoldTests(unittest.TestCase):
         self.assertEqual(locked, [1], 'the lock released while a hold was still asked')
         self.assertFalse(aborted)
         self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)] * 2)
+
+    def test_a_print_paused_on_the_button_stays_locked_while_the_cooling_engine_holds(self):
+        # Paused at 0.05; fire refused from 0.2 (the latch locks under the
+        # pause) while the engine locks its own hold; the verdict is clean at
+        # 0.5, but the kernel refuses the unlock, so the button stays dark and
+        # the press at 0.7, taken under the lock, resumes nothing. The engine
+        # releases at 0.8, the unlock takes, and the press at 1.0 resumes.
+        clock = MachineClock(self, self.m)
+        held = []
+        clock.press(0.05)
+        clock.at(0.20, lambda: (setattr(COOL, '_hold', False), setattr(COOL, '_fire_ok', False),
+                                setattr(CNC, 'engine_holds', True)))
+        clock.at(0.30, lambda: LEDS.button_colors.clear())     # the lamp from the lock on
+        clock.at(0.50, self._release)
+        clock.at(0.65, lambda: held.append((CNC.latch, 'breathe' in LEDS.button_colors)))
+        clock.press(0.70)
+        clock.at(0.80, lambda: setattr(CNC, 'engine_holds', False))
+        clock.press(1.00)
+        clock.at(1.30, lambda: setattr(CNC, '_reads_left', 1))
+        aborted = self._run()
+        self.assertEqual(held, [(1, False)], 'locked and dark while the engine holds')
+        self.assertFalse(aborted)
+        self.assertEqual([s for s in CNC.starts if s[0] == 'resume'], [('resume', 0, 0)],
+                         'one resume, on the press after the unlock, with the hardware latch cleared')
 
     def test_a_feed_hold_whose_latch_was_locked_under_it_resumes_on_a_press(self):
         self.m._feeder = FakeFeeder(written=100)

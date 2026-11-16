@@ -4,6 +4,7 @@ Written by Scott Wiederhold
 https://community.openglow.org
 SPDX-License-Identifier:    MIT
 """
+import errno
 import fcntl
 import json
 import logging
@@ -487,13 +488,28 @@ class Machine(BaseMachine):
         self._press_live = False
         cnc.laser_latch(1)
 
-    def _latch_unlock(self) -> None:
+    def _latch_unlock(self) -> bool:
         """Release the lock, for the press that comes next. A press from
-        before this moment does not count: the hardware ignored it."""
+        before this moment does not count: the hardware ignored it.
+        Returns whether the latch unlocked. The kernel refuses the unlock
+        (EBUSY) while the cooling engine holds the latch, its own hold that
+        no controller unlock undoes, and then nothing changed: the latch is
+        still locked and no press can count. A run of refusals is named
+        once, until an unlock takes."""
         self._press_live = False
         self._button_pressed = False
         self._button_edges = 0
-        cnc.laser_latch(0)
+        try:
+            cnc.laser_latch(0)
+        except OSError as e:
+            if e.errno != errno.EBUSY:
+                raise
+            if not getattr(self, '_latch_refusal_told', False):
+                self._latch_refusal_told = True
+                logger.warning('the laser latch stays locked: the cooling engine holds it')
+            return False
+        self._latch_refusal_told = False
+        return True
 
     @staticmethod
     def _button_timeout_s() -> float:
@@ -524,7 +540,15 @@ class Machine(BaseMachine):
         self._arm_until = None
         self._verdict_wait()
         while not self._running_action_cancelled:
-            self._latch_unlock()
+            if not self._latch_unlock():
+                # The cooling engine locked the latch after the verdict was
+                # read: no press is asked for that could not count, and the
+                # print is canceled.
+                logger.warning('the cooling engine holds the laser latch - the print is canceled')
+                self._latch_lock()
+                cooling_svc.set_armed(False)
+                self._running_action_cancelled = True
+                break
             if self._arm_until is None:
                 self._arm_until = monotonic() + self._button_timeout_s() + self._hold_max_s()
             self._press_again = False
@@ -1599,8 +1623,8 @@ class Machine(BaseMachine):
             # the button breathes only from then, and the press that
             # resumes it is taken with the latch unlocked.
             if lit and paused and verdict_latched and v_resume and v_fire_ok:
-                verdict_latched = False
-                self._latch_unlock()
+                if self._latch_unlock():
+                    verdict_latched = False
             if verdict_held:
                 if pausable and v:
                     self._fault_report(v)
@@ -1614,13 +1638,17 @@ class Machine(BaseMachine):
                 go = clean and not (lit and not self._press_live)
                 if clean and not go:
                     if not rearm:
-                        if verdict_latched:
+                        # An unlock the kernel refuses (the cooling engine
+                        # holds the latch) leaves the job held: no press is
+                        # asked for, the unlock is tried again on the next
+                        # pass, and the hold's bound still ends it.
+                        if verdict_latched and self._latch_unlock():
                             verdict_latched = False
-                            self._latch_unlock()
-                        self._button_edges = 0
-                        rearm = True
-                        logger.info('cooling verdict clean; the laser is unlocked and '
-                                    'the job waits for the button')
+                        if not verdict_latched:
+                            self._button_edges = 0
+                            rearm = True
+                            logger.info('cooling verdict clean; the laser is unlocked and '
+                                        'the job waits for the button')
                     elif self._button_edges:
                         self._button_edges = 0
                         self._press_live = True
