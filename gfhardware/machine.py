@@ -1853,18 +1853,18 @@ class Machine(BaseMachine):
         if cnc.state is not MachineState.IDLE:
             logger.info('machine is not idle, state: %s' % cnc.state.value)
             return False
-        temp = temp_sensor.water_2.C
-        # A backstop behind the cooling engine's own start gate (the
-        # verdict is checked again before arming); a config without the
-        # key leaves the gate to the engine.
-        limit = get_cfg('THERMAL.MAX_START_TEMP')
-        if limit is not None and temp > float(limit):
-            logger.info('machine temp is too high, temp: %s' % temp)
-            return False
-        if temp <= -100:
-            # A dead or disconnected coolant sensor reads the -273.15
-            # sentinel, which must not pass the gate as "cold enough".
-            logger.info('coolant sensor reads invalid (%s); unsafe to move' % temp)
+        # The coolant's temperature limits are the cooling engine's alone:
+        # they gate fire, and a print waits on the engine's verdict before
+        # the press is asked for. The one coolant check here is for a
+        # reading taken as no reading: a shorted sensor (by the circuit, a
+        # count of 0 or a value over 100 C), an open or disconnected one (at
+        # or past the converter's rail, or under 0 C) and a loop under 0 C
+        # read the -273.15 sentinel, which must not pass as a loop fit to
+        # run, gated on the lid or not. The log names which, from the count.
+        reading = temp_sensor.water_2
+        if reading.C <= -100:
+            logger.info('coolant sensor reads invalid (%s; %s); unsafe to move'
+                        % (coolant_no_reading(reading.raw) or 'no reading', reading))
             return False
         return True
 

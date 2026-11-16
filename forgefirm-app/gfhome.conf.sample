@@ -32,12 +32,6 @@ status_file: /data/forgefirm/gf-latest.json
 save_puls: False
 save_sent_images: False
 
-[THERMAL]
-# Thermal policy (fans, pump, TEC, heater) belongs to the forgectrl
-# cooling engine; only the start-gate ceiling lives here.
-# Real-temperature ceiling; the coolant conversion reads true degrees C.
-max_start_temp: 27
-
 [MOTION]
 # Extra lens half-steps applied after the hunt (0 = hall reference).
 z_home_offset: 0

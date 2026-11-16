@@ -371,6 +371,7 @@ def _install_fakes():
     cooling_mod = types.ModuleType('gfhardware.cooling')
 
     class _Temp:
+        raw = 680
         C = 20.0
 
     class _Sensors:
@@ -446,11 +447,21 @@ def _install_fakes():
 
 CNC, SW, COOL, LEDS, CAM = _install_fakes()
 
+# The real temperature sensors, for the cases that read through them: the
+# machine itself gets the fake above.
+_spec = importlib.util.spec_from_file_location(
+    '_real_cooling', os.path.join(ROOT, 'gfhardware', 'cooling.py'))
+REAL_COOLING = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(REAL_COOLING)
+# The machine names a refused reading with the real rule, and imports what
+# the real module exports.
+sys.modules['gfhardware.cooling'].coolant_no_reading = REAL_COOLING.coolant_no_reading
+sys.modules['gfhardware.cooling'].__all__ = list(REAL_COOLING.__all__)
+
 import gfhardware.machine as machine_mod          # noqa: E402
 from gfhardware.machine import Machine             # noqa: E402
 from gfutilities.configuration import set_cfg     # noqa: E402
 
-set_cfg('THERMAL.MAX_START_TEMP', 50)
 # Point the reads the constructor makes at fakes.
 machine_mod.read_file = lambda attr, binary=False: 'hw_id=0x4c\nserial=1\nversion=0x2\nr5=0\nr6=0'
 EVENTS = []
@@ -471,6 +482,33 @@ def make_machine():
     m.running_action_id = 42
     m._running_action_cancelled = False
     return m
+
+
+def real_sensors(case, pic):
+    """The real cooling module's sensors over a scratch sysfs: pic maps a
+    pic/ attribute to the text it reads. No hwmon node is bound until the
+    case binds one (bind_lm75)."""
+    root = tempfile.TemporaryDirectory()
+    case.addCleanup(root.cleanup)
+    os.makedirs(os.path.join(root.name, 'glowforge', 'pic'))
+    os.makedirs(os.path.join(root.name, 'hwmon'))
+    for attr, text in pic.items():
+        with open(os.path.join(root.name, 'glowforge', 'pic', attr), 'w') as f:
+            f.write(text)
+    for name, value in (('SYSFS_GF_BASE', os.path.join(root.name, 'glowforge') + '/'),
+                        ('HWMON_BASE', os.path.join(root.name, 'hwmon'))):
+        case.addCleanup(setattr, REAL_COOLING, name, getattr(REAL_COOLING, name))
+        setattr(REAL_COOLING, name, value)
+    return REAL_COOLING._Temp()
+
+
+def bind_lm75(millidegrees):
+    """The LM75's hwmon node appears, as when the chip binds late."""
+    node = os.path.join(REAL_COOLING.HWMON_BASE, 'hwmon3')
+    os.makedirs(node)
+    for attr, text in (('name', 'lm75b'), ('temp1_input', str(millidegrees))):
+        with open(os.path.join(node, attr), 'w') as f:
+            f.write(text + '\n')
 
 
 _MONOTONIC, _SLEEP = machine_mod.monotonic, machine_mod.sleep
@@ -904,18 +942,94 @@ class StartGateTests(unittest.TestCase):
         self.addCleanup(setattr, machine_mod.temp_sensor.water_2, 'C', machine_mod.temp_sensor.water_2.C)
         machine_mod.temp_sensor.water_2.C = c
 
-    def test_a_loop_over_the_start_limit_does_not_move(self):
-        # THERMAL.MAX_START_TEMP is 50 here; at the limit it still starts.
-        self._coolant(50.0)
+    def test_a_warm_loop_moves_whatever_a_seeded_start_limit_says(self):
+        # The coolant's limits are the cooling engine's: a loop over the
+        # engine's 33 C ceiling still moves (a print then waits on the
+        # verdict), and the max_start_temp a seeded gfhome.conf carries, as
+        # the string the parser gives, is read by nothing.
+        self.addCleanup(set_cfg, 'THERMAL.MAX_START_TEMP', None)
+        set_cfg('THERMAL.MAX_START_TEMP', '27')
+        self._coolant(34.0)
         self.assertTrue(self.m._safe_to_move())
-        self._coolant(50.5)
-        self.assertFalse(self.m._safe_to_move())
 
     def test_a_dead_coolant_sensor_does_not_move(self):
         # A dead or disconnected sensor reads the -273.15 sentinel, which
-        # must not pass as cold enough.
+        # must not pass as cold enough: not for a job gated on the lid, and
+        # not for a hunt's pulse file, which is not.
         self._coolant(-273.15)
         self.assertFalse(self.m._safe_to_move())
+        self.assertFalse(self.m._safe_to_move(lid_gated=False))
+
+    def _real_coolant(self, raw):
+        self.addCleanup(setattr, machine_mod, 'temp_sensor', machine_mod.temp_sensor)
+        machine_mod.temp_sensor = real_sensors(self, {'water_temp_2': raw})
+
+    def test_an_open_coolant_sensor_does_not_move(self):
+        # By the circuit an open thermistor pulls its input to the ADC's
+        # rail, 1023, and the 16-bit attribute can carry a count past it:
+        # a count of 1023 or more is no reading. 1332 is the first count
+        # past the conversion's scale. Read through the real sensor, none
+        # moves.
+        for raw in ('1023', '1332', '65535'):
+            with self.subTest(raw=raw):
+                self._real_coolant(raw)
+                self.assertFalse(self.m._safe_to_move())
+
+    def test_a_refused_start_logs_the_phrases_forgetest_reads(self):
+        # forgetest's cloud tests find a start refused for the coolant by
+        # these two phrases on one line.
+        self._real_coolant('3')
+        with self.assertLogs('openglow', level='INFO') as logs:
+            self.assertFalse(self.m._safe_to_move())
+        self.assertTrue(any('coolant sensor reads invalid' in ln and 'unsafe to move' in ln
+                            for ln in logs.output), logs.output)
+
+    def test_a_shorted_coolant_sensor_does_not_move(self):
+        # By the circuit a shorted thermistor reads 0, or a few counts over
+        # it: 3 counts is about 371 C. Read through the real sensor, neither
+        # is taken as a reading.
+        for raw in ('0', '3'):
+            with self.subTest(raw=raw):
+                self._real_coolant(raw)
+                self.assertFalse(self.m._safe_to_move())
+
+    def test_the_line_between_a_reading_and_no_reading_is_0_c(self):
+        # Through the real sensor: count 982 is +0.08 C and moves; 983 is
+        # just under 0 C, the band an open sensor reads in, and does not.
+        self._real_coolant('982')
+        self.assertTrue(self.m._safe_to_move())
+        self._real_coolant('983')
+        self.assertFalse(self.m._safe_to_move())
+
+    def test_the_line_between_a_reading_and_no_reading_is_100_c(self):
+        # Through the real sensor: count 124 is 99.9 C and moves; 123 is
+        # 100.3 C, the band a shorted sensor reads in, and does not.
+        self._real_coolant('124')
+        self.assertTrue(self.m._safe_to_move())
+        self._real_coolant('123')
+        self.assertFalse(self.m._safe_to_move())
+
+
+class TempLogTests(unittest.TestCase):
+
+    def test_a_sensor_that_cannot_be_read_logs_as_none(self):
+        # The temperatures a print logs (at its start, its end and after the
+        # cool-down) never end it: a sensor with no node (the LM75 not bound)
+        # and one whose read is not a number are None; a coolant count of 0
+        # converts to the sentinel; the rest read.
+        sensors = real_sensors(self, {'water_temp_1': '0', 'water_temp_2': '640', 'tec_temp': ''})
+        temps = sensors.all
+        self.assertIsNone(temps['chassis'])
+        self.assertIsNone(temps['tec'])
+        self.assertEqual(temps['water_1'].C, round(-273.15, 1))
+        self.assertEqual(temps['water_2'].C, 27.0)
+
+    def test_the_chassis_sensor_is_read_once_it_binds(self):
+        # The LM75's node is found at each read: a chip that binds after
+        # the client built its sensors is read.
+        sensors = real_sensors(self, {})
+        bind_lm75(23500)
+        self.assertEqual(sensors.chassis.C, 23.5)
 
 
 class ReturnHomeTests(unittest.TestCase):
@@ -944,6 +1058,17 @@ class ReturnHomeTests(unittest.TestCase):
         self.assertIn(('clear_pulse', 1), w)
         self.assertIn(('run', 1), w)
         self.assertLess(w.index(('clear_pulse', 1)), w.index(('run', 1)))
+        self.assertEqual(self.parks, [(-500, -300)])
+        self.assertEqual(job_events(), ['print:return_to_home:succeeded'])
+
+    def test_a_dead_coolant_sensor_does_not_stop_the_park(self):
+        # The start's sensor check is the start's: a print whose coolant
+        # sensor died under it still parks.
+        self.addCleanup(setattr, machine_mod.temp_sensor.water_2, 'C', machine_mod.temp_sensor.water_2.C)
+        machine_mod.temp_sensor.water_2.C = -273.15
+        CNC.xy_steps = (500, 300)
+        CNC.run_reads = 3
+        self.m._return_home(None)
         self.assertEqual(self.parks, [(-500, -300)])
         self.assertEqual(job_events(), ['print:return_to_home:succeeded'])
 
