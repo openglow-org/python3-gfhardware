@@ -24,6 +24,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: openglow-org/Glowforge-Utilities
+          ref: ${{ (github.ref_name == 'next' || github.base_ref == 'next') && 'next' || '' }}
           path: Glowforge-Utilities
       - uses: actions/setup-python@v5
         with:
