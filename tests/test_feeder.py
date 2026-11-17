@@ -298,6 +298,24 @@ class PulseBodyTests(unittest.TestCase):
         self.assertFalse(feeder.finished)
         feeder.stop()
 
+    def test_a_job_that_never_fires_refuses_any_fire_byte(self):
+        # A motion or a hunt: a FIRE byte is refused even after a power byte,
+        # in whichever chunk the power byte and the FIRE byte come; the
+        # chunks before the FIRE byte reach the ring.
+        layouts = {'power in the first chunk': POWERED + STEP * 100 + FIRE + STEP * 20,
+                   'power past the first chunk': STEP * 20 + POWERED + STEP * 20 + FIRE + STEP * 20}
+        for name, payload in layouts.items():
+            with self.subTest(name):
+                ring = FakeRing(1 << 20)
+                feeder = PulseFeeder(PulseSource(_puls(payload)), ring,
+                                     chunk=16, retry_s=0.01, fire_allowed=False)
+                feeder.start()
+                self.assertFalse(feeder.wait_primed(timeout=5))
+                self.assertIsInstance(feeder.error, PulseBodyError)
+                self.assertTrue(ring.accepted, 'no chunk before the FIRE byte reached the ring')
+                self.assertNotIn(FIRE, ring.accepted, 'the FIRE byte reached the ring')
+                feeder.stop()
+
     def test_every_byte_value_is_judged_by_its_class(self):
         # Each of the 256 values as the first byte after step bytes: a FIRE
         # byte (bit 7 clear, bit 4 set; it carries step bits) is refused, a

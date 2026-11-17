@@ -12,6 +12,10 @@ from gfhardware._common import *
 logger = logging.getLogger(LOGGER_NAME)
 
 
+class LensStopped(RuntimeError):
+    """A lens move ended by its caller's stop before it was done."""
+
+
 class ZAxis(object):
     # Full Z travel is a few dozen full steps; several times that bounds a
     # homing sweep so a failed hall sensor cannot drive the lens carriage
@@ -39,21 +43,27 @@ class ZAxis(object):
         write_file(SYSFS_GF_BASE + 'head/z_enable', '0')
 
     @staticmethod
-    def home() -> list:
+    def home(stop=None) -> list:
+        """The lens referenced on the hall sensor's edge. `stop`, when given,
+        is read before every step: once it answers true the move ends there
+        with LensStopped. Every way out rests the driver at its hold current
+        in half-step mode."""
         logger.info('starting z homing cycle')
         concurrence = []
         z_pos = 0
 
         ZAxis.configure(enabled=True, current=ZCur.HIGH, mode=Microstep.FULL)
-        ZAxis._step_until(False)
-        ZAxis._step_until(True)
+        try:
+            ZAxis._step_until(False, stop)
+            ZAxis._step_until(True, stop)
 
-        while len(concurrence) < 5:
-            logger.info('pass: %s', len(concurrence) + 1)
-            z_pos = z_pos + (ZAxis._step_until(False) * 2)
-            z_pos = z_pos + (ZAxis._step_until(True) * 2)
-            concurrence.append(z_pos)
-        ZAxis.configure(current=ZCur.LOW, mode=Microstep.HALF)
+            while len(concurrence) < 5:
+                logger.info('pass: %s', len(concurrence) + 1)
+                z_pos = z_pos + (ZAxis._step_until(False, stop) * 2)
+                z_pos = z_pos + (ZAxis._step_until(True, stop) * 2)
+                concurrence.append(z_pos)
+        finally:
+            ZAxis.configure(current=ZCur.LOW, mode=Microstep.HALF)
         logger.info('homing cycle complete: %s' % concurrence)
         return concurrence
 
@@ -100,12 +110,14 @@ class ZAxis(object):
         sleep(step_delay)
 
     @staticmethod
-    def _step_until(at_home: bool) -> int:
+    def _step_until(at_home: bool, stop=None) -> int:
         logger.info('starting z_step until at_home: %s' % at_home)
         step_count = 0
         step = 1 if at_home else -1
         step_dir = Dir.Pos if at_home else Dir.Neg
         while ZAxis._home_sense() is not at_home:
+            if stop is not None and stop():
+                raise LensStopped('the lens move was stopped after %d steps' % abs(step_count))
             if abs(step_count) >= ZAxis.MAX_HOME_STEPS:
                 raise RuntimeError(
                     'z home sense never reached %s after %d steps '
@@ -117,4 +129,4 @@ class ZAxis(object):
         return step_count
 
 
-__all__ = ['ZAxis']
+__all__ = ['LensStopped', 'ZAxis']

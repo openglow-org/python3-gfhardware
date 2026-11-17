@@ -404,6 +404,13 @@ class Machine(BaseMachine):
     See parent class for method documentation
     """
 
+    # Set by the web-service homing runner before start(): the session runs
+    # under the GRBL controller, whose button lamp it is, with forgectrl
+    # owning the lid lamp and the rail. The session writes no button lamp
+    # and no lid lamp level; on the brokered device it writes no enable
+    # either, and starts only from an idle kernel.
+    homing_session = False
+
     def __init__(self):
         # The thermal hardware (fans, pump, TEC, heater) is owned by the
         # forgectrl cooling engine; the pulse header's RUN fan duties go
@@ -911,13 +918,13 @@ class Machine(BaseMachine):
             ('put the button out', self._lamp_off),
         ))
 
-    @staticmethod
-    def _lamp_off() -> None:
+    def _lamp_off(self) -> None:
         """The button dark, where the light on it is this client's: its
         breathing white or its solid white, or a button that cannot be
         read. forgectrl's red flash and its setup lights are not this
-        client's to put out."""
-        if button_pattern() in (None, 'breathe', 'white'):
+        client's to put out, and in a homing session no light on the button
+        is."""
+        if not self.homing_session and button_pattern() in (None, 'breathe', 'white'):
             set_button_color(ButtonColor.OFF)
 
     @staticmethod
@@ -932,20 +939,68 @@ class Machine(BaseMachine):
 
     def _initialize(self) -> None:
         logger.debug('initializing machine')
+        # The latch is locked before anything else is written: a process
+        # starts on the latch its predecessor left, and nothing this one
+        # does before its first print's own unlock needs it open.
+        self._latch_lock()
         self._sw_thread.start()
         # Setup machine. The thermal posture (pump, TEC, heater, fans)
         # belongs to the forgectrl cooling engine; this client only
         # starts reporting job state to it.
         cooling_svc.start()
-        set_lid_led(MACHINE_SETTINGS['LLvl'].default)
+        # A homing session the GRBL controller handed the brokered device to
+        # starts only from an idle kernel, and leaves the rail to forgectrl.
+        # Run by hand with no broker, the session enables the rail itself,
+        # as the cloud client does (cnc.reset() takes it down then).
+        handed_over = self.homing_session and _inherited_pulse_dev() is not None
+        if handed_over:
+            # The controller hands the device over from an idle kernel only;
+            # a fault met here is not the session's to clear.
+            state = cnc.state
+            if state is not MachineState.IDLE:
+                raise RuntimeError('the kernel reads %s, not idle: the homing session '
+                                   'does not start' % state.name)
+        if not self.homing_session:
+            set_lid_led(MACHINE_SETTINGS['LLvl'].default)
         cnc.reset()
         ZAxis.reset()
-        set_button_color(ButtonColor.OFF)
-        cnc.enable()
+        if not self.homing_session:
+            set_button_color(ButtonColor.OFF)
+        if not handed_over:
+            self._enable()
         # A client stopped mid-hold (the fail tiers restart it) could not reset
         # its fault, and the machine's record at the service would keep it.
         for fault in sorted(set(HOLD_FAULTS.values()) | {f for _, f in AIRFLOW_FAULTS}):
             send_wss_event(self._q_msg_tx, None, 'fault:%s:reset' % fault)
+
+    @staticmethod
+    def _enable() -> None:
+        """The kernel enabled, once. Enable is the kernel's only way out of a
+        stepper fault, and a client starts after a fail tier's stop or a
+        respawn with whatever fault the last one left: a fault this clears
+        is logged with its lines, and one whose lines still read asserted
+        stays a fault, logged as such, and is not tried again."""
+        before = cnc.state
+        lines = cnc.faults if before is MachineState.FAULT else ''
+        cnc.enable()
+        if before is MachineState.FAULT:
+            if cnc.state is MachineState.FAULT:
+                logger.error('the kernel stays in a stepper fault (faults: %s)', cnc.faults)
+            else:
+                logger.warning('a stepper fault was cleared at the start (faults: %s)', lines)
+
+    def stop_now(self) -> None:
+        """The machine stopped at once, from a signal handler: the running
+        action canceled, so a motion still loading never starts its run,
+        the kernel stopped and the latch locked. It takes no lock: a handler
+        runs on the main thread wherever that thread is, a lock it holds
+        included. The run loop reads the cancel at its next pass (0.1 s at
+        the most). stop() follows on the caller's own path."""
+        self._running_action_cancelled = True
+        self._safe_steps('stop now', (
+            ('stop motion', cnc.stop),
+            ('lock the laser latch', self._latch_lock),
+        ))
 
     def _lid_image(self, msg: dict, settings: dict = None) -> None:
         # The flash is the service's to ask for, per shot, and a lid image is
@@ -1059,7 +1114,10 @@ class Machine(BaseMachine):
         else:
             # Fill the ring before the operator is asked for the button, so a
             # job that cannot be loaded fails before the laser is ever armed.
-            self._feeder = PulseFeeder(source, pulse_dev)
+            # Only a print fires: a motion's or a hunt's feed refuses any
+            # FIRE byte before the ring.
+            self._feeder = PulseFeeder(source, pulse_dev,
+                                       fire_allowed=msg['action_type'] == 'print')
             self._feeder.start()
             try:
                 self._feed_and_run(msg, source, lid_gated)
@@ -1687,7 +1745,12 @@ class Machine(BaseMachine):
                 self._running_action_cancelled = True
                 set_button_color(ButtonColor.OFF)
                 return True
-        set_button_color(ButtonColor.WHITE)
+        else:
+            # A run that never fires starts locked, whatever lock state it
+            # met: the lock costs nothing a motion, a hunt or a park needs.
+            self._latch_lock()
+        if not self.homing_session:
+            set_button_color(ButtonColor.WHITE)
         self._button_edges = 0
         self._enclosure_edge = False
         self._run_wake.clear()
@@ -1748,7 +1811,9 @@ class Machine(BaseMachine):
             # press taken then would not count.
             lamp = ('breathe' if rearm or (paused and not v_hold and not verdict_latched)
                     else 'off' if paused or verdict_held or feed_held else 'white')
-            if lamp != lamp_now:
+            if self.homing_session:
+                pass                        # the GRBL controller's lamp, not the session's
+            elif lamp != lamp_now:
                 lamp_now = lamp
                 if lamp == 'breathe':
                     set_button_breathe()
@@ -2101,7 +2166,8 @@ class Machine(BaseMachine):
                              'did not finish', pos.bytes.processed, pos.bytes.total)
                 self._running_action_cancelled = True
                 aborted = True
-        set_button_color(ButtonColor.OFF)
+        if not self.homing_session:
+            set_button_color(ButtonColor.OFF)
         self._fault_clear()
         if progress is not None:
             # Where the job actually ended, whether that is the end of the

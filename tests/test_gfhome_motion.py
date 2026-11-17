@@ -16,6 +16,7 @@ Run:  PYTHONPATH=.:forgefirm-app:../Glowforge-Utilities python3 -m unittest test
 import json
 import os
 import sys
+import time
 import types
 import unittest
 
@@ -53,31 +54,44 @@ class SessionTests(unittest.TestCase):
         self.addCleanup(lambda: [setattr(gfhome, k, v) for k, v in saved.items()])
         park = gfhome.ffmachine.park_lens
         self.addCleanup(setattr, gfhome.ffmachine, 'park_lens', park)
-        gfhome.ffmachine.park_lens = lambda half_steps: None
+        gfhome.ffmachine.park_lens = lambda half_steps, stop=None: None
         gfhome.get_session = lambda: object()
         gfhome.authenticate_machine = lambda s: True
         gfhome._AccelWatch = Witness
+        self.addCleanup(setattr, Witness, 'motion_windows', 3)
+        self.actions = ['hunt', 'motion']
+        self.dispatched = []
+        self.on_hunt = lambda: None
+        self.args = types.SimpleNamespace(timeout=30, start_timeout=30, quiet=0,
+                                          deadline=time.monotonic() + 30)
 
-        def connect(q_rx, q_tx):
-            for action in ('hunt', 'motion'):
+        def connect(q_rx, q_tx, session):
+            self.assertIsNotNone(session)       # a reconnect signs in again
+            for action in self.actions:
                 q_rx.put(json.dumps({'action_type': action, 'status': 'ready'}))
             return self.ws
         gfhome.ws_connect = connect
 
         def dispatch(machine, msg, allow_print):
             self.assertFalse(allow_print)
+            self.dispatched.append(msg['action_type'])
             if msg['action_type'] == 'motion':
                 self.ends(machine)
+            else:
+                self.on_hunt()
             return msg['action_type']
         gfhome.dispatch_action = dispatch
         gfhome._stop.clear()
 
     def home(self):
-        args = types.SimpleNamespace(timeout=30, start_timeout=30, quiet=0)
         with lens_modules(lambda: None):
             with self.assertLogs('openglow', level='INFO') as logs:
-                rc = gfhome.home(self.machine, args)
+                rc = gfhome.home(self.machine, self.args)
         return rc, [r.getMessage() for r in logs.records]
+
+    @staticmethod
+    def whole(machine):
+        machine._motion_stats = {'stats': dict(STATS)}
 
     def test_a_motion_that_ran_whole_homes(self):
         # The negative control: the same session, the motion finished.
@@ -109,6 +123,44 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertTrue(any('did not run whole (no end on record)' in m for m in said), said)
         self.assertFalse(any(m.startswith('homing complete') for m in said), said)
+
+    def test_a_session_the_accelerometer_never_saw_move_is_not_homed(self):
+        self.ends = self.whole
+        Witness.motion_windows = 0
+        rc, _ = self.home()
+        self.assertEqual(rc, 2)
+
+    def test_the_same_correction_repeated_is_not_homed(self):
+        # The service repeats a correction a machine that does not move
+        # never satisfies: four motions to the same end.
+        self.ends = self.whole
+        self.actions = ['hunt'] + ['motion'] * 4
+        self.args.quiet = 0.3           # the motions come back to back, never quiet between
+        rc, _ = self.home()
+        self.assertEqual(rc, 2)
+
+    def test_an_open_lid_runs_no_session(self):
+        self.ends = self.whole
+        self.machine.lid_closed = False
+        rc, _ = self.home()
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.dispatched, [])
+
+    def test_a_session_past_its_deadline_ends_not_homed(self):
+        # The deadline passes during the hunt; the motion is never run.
+        self.ends = self.whole
+        self.on_hunt = lambda: setattr(self.args, 'deadline', time.monotonic() - 1)
+        rc, _ = self.home()
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.dispatched, ['hunt'])
+
+    def test_a_service_that_never_starts_homing_ends_the_session(self):
+        self.actions = []
+        self.args.start_timeout = 0
+        t0 = time.monotonic()
+        rc, _ = self.home()
+        self.assertEqual(rc, 2)
+        self.assertLess(time.monotonic() - t0, 5.0)
 
 
 if __name__ == '__main__':

@@ -4,7 +4,8 @@ The controller hands the runner the whole half-steps from the hall edge
 to the park height (GFHOME_PARK_HALF_STEPS, clamped there to the window
 every head reaches without touching a stop). The park takes them at the
 run current in half-step mode, up or down, and rests the motor at the
-hold current; a count of zero moves nothing. The lens axis is a fake that
+hold current; a count of zero moves nothing; a stop read before every step
+ends the park there, the motor rested. The lens axis is a fake that
 records every call, installed only for the duration of each call.
 
 Copyright 2026 514 LLC d/b/a OpenGlow
@@ -45,6 +46,10 @@ class Dir(enum.Enum):
 CALLS = []
 
 
+class LensStopped(RuntimeError):
+    pass
+
+
 class FakeZAxis:
     @staticmethod
     def configure(enabled=None, current=ZCur.LOW, mode=Microstep.HALF):
@@ -63,6 +68,7 @@ def fake_lens_modules():
     common.ZCur, common.Microstep, common.Dir = ZCur, Microstep, Dir
     z = types.ModuleType('gfhardware.z_axis')
     z.ZAxis = FakeZAxis
+    z.LensStopped = LensStopped
     return mock.patch.dict(sys.modules, {'gfhardware': pkg, 'gfhardware._common': common,
                                          'gfhardware.z_axis': z})
 
@@ -90,6 +96,21 @@ class ParkTests(unittest.TestCase):
     def test_a_zero_park_moves_nothing_and_touches_nothing(self):
         self.park(0)
         self.assertEqual(CALLS, [])
+
+    def test_a_stop_ends_the_park_at_its_next_step_and_rests_the_motor(self):
+        stop = lambda: sum(1 for c in CALLS if c[0] == 'step') == 2      # noqa: E731
+        with fake_lens_modules():
+            with self.assertRaises(LensStopped):
+                ffmachine.park_lens(5, stop=stop)
+        self.assertEqual(CALLS[1:3], [('step', Dir.Pos)] * 2)
+        self.assertEqual(CALLS[3:], [('configure', None, ZCur.LOW, Microstep.HALF)])
+
+    def test_a_stop_already_set_takes_no_step(self):
+        with fake_lens_modules():
+            with self.assertRaises(LensStopped):
+                ffmachine.park_lens(5, stop=lambda: True)
+        self.assertNotIn('step', [c[0] for c in CALLS])
+        self.assertEqual(CALLS[-1], ('configure', None, ZCur.LOW, Microstep.HALF))
 
 
 if __name__ == '__main__':

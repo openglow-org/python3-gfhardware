@@ -27,12 +27,14 @@ import importlib.util
 import math
 import os
 import queue
+import signal
 import sys
 import tempfile
 import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -203,6 +205,10 @@ class FakeCNC:
         self._walking = None
         self.position_error = None
         self.unlocked_walking = []
+        # The fault lines cnc/faults reads, and whether they still read
+        # asserted (enable then leaves the kernel in its fault).
+        self.fault_lines = ''
+        self.fault_held = False
 
     @property
     def step_freq(self):
@@ -286,7 +292,18 @@ class FakeCNC:
         self.streaming_writes.append(int(val))
 
     def set_pulse_dev(self, dev): pass
-    def enable(self): pass
+
+    def enable(self):
+        """The kernel's only way out of a fault, unless its lines still
+        read asserted."""
+        self.writes.append(('enable', 1))
+        if self._state is MachineState.FAULT and not self.fault_held:
+            self._state = MachineState.IDLE
+
+    @property
+    def faults(self):
+        return self.fault_lines
+
     def disable(self): pass
     def reset(self): pass
 
@@ -714,6 +731,16 @@ def make_machine():
     return m
 
 
+def gfhome_module():
+    """The web-service homing runner, whose SIGTERM handler a case runs on
+    this machine; imported on first use."""
+    app = os.path.join(ROOT, 'forgefirm-app')
+    if app not in sys.path:
+        sys.path.insert(0, app)
+    import gfhome
+    return gfhome
+
+
 def real_sensors(case, pic):
     """The real cooling module's sensors over a scratch sysfs: pic maps a
     pic/ attribute to the text it reads. No hwmon node is bound until the
@@ -836,6 +863,13 @@ class RunLoopTests(unittest.TestCase):
         # Edge-driven: the stop lands well inside one 100 ms poll tick.
         self.assertLess(dt, 0.15, 'stop was not edge-driven (%.3f s)' % dt)
 
+    def test_a_run_that_never_fires_starts_locked(self):
+        # A motion meets the latch a predecessor left unlocked.
+        CNC.latch = CNC.hw_latch = 0
+        CNC.run_reads = 3
+        self.assertFalse(self.m._run_loop())
+        self.assertEqual(CNC.starts, [('run', 1, 1)])
+
     def test_interlock_open_mid_run_stops_and_cancels(self):
         SW.open_interlock(delay=0.05)
         aborted = self.m._run_loop()
@@ -950,8 +984,10 @@ class RunLoopTests(unittest.TestCase):
         self.assertLess(w.index(('resume', -2000)), w.index(('resume', 1950)))
         self.assertEqual(job_events(), ['print:paused', 'print:resumed'])
         self.assertFalse(self.m._running_action_cancelled)
-        # The latch was never touched by the pause.
-        self.assertNotIn(('laser_latch', 1), w)
+        # The pause never touched the latch: the one lock is the start's, as
+        # every run that does not fire starts.
+        self.assertEqual(w.count(('laser_latch', 1)), 1)
+        self.assertLess(w.index(('laser_latch', 1)), w.index(('run', 1)))
 
     def test_button_does_not_pause_a_motion(self):
         CNC.run_reads = 5
@@ -1430,6 +1466,103 @@ class StartGateTests(unittest.TestCase):
         self.assertTrue(self.m._safe_to_move())
         self._real_coolant('123')
         self.assertFalse(self.m._safe_to_move())
+
+
+class InitializeTests(unittest.TestCase):
+    """What a client's or a homing runner's start writes."""
+
+    def setUp(self):
+        CNC.__init__()
+        SW.__init__()
+        COOL.__init__()
+        del LEDS.button_colors[:]
+        # The start's other writes land in the kernel's list, in order.
+        for owner, name, fn in ((machine_mod, 'set_lid_led', lambda v: CNC.writes.append(('lid_led', v))),
+                                (machine_mod.ZAxis, 'reset', lambda: CNC.writes.append(('z_reset', 1))),
+                                (CNC, 'reset', lambda: CNC.writes.append(('reset', 1)))):
+            patch = mock.patch.object(owner, name, fn)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.m = make_machine()
+        self.m._q_msg_tx = None
+
+    def handed_over(self):
+        """The runner's case: the GRBL controller handed it the brokered
+        device."""
+        self.m.homing_session = True
+        patch = mock.patch.object(machine_mod, '_inherited_pulse_dev', lambda: object())
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_the_latch_lock_is_the_first_write(self):
+        CNC.latch = CNC.hw_latch = 0                # what a predecessor left
+        self.m._initialize()
+        self.assertEqual(CNC.writes[0], ('laser_latch', 1))
+        self.assertEqual({w[0] for w in CNC.writes[1:4]}, {'lid_led', 'reset', 'z_reset'})
+
+    def test_a_homing_session_leaves_the_lamps_and_the_rail_alone(self):
+        # A camera home under the GRBL controller: the button is the
+        # controller's, the lid lamp and the rail forgectrl's, through its
+        # start, one motion it plays, and its cleanup's lamp.
+        self.handed_over()
+        LEDS.pattern = 'breathe'            # a light this client would put back or out
+        self.addCleanup(setattr, LEDS, 'pattern', None)
+        self.m._initialize()
+        CNC.run_reads = 3
+        self.assertFalse(self.m._run_loop())
+        self.m._lamp_off()
+        self.assertEqual(CNC.writes[0], ('laser_latch', 1))
+        self.assertEqual(LEDS.button_colors, [])
+        self.assertNotIn('lid_led', [w[0] for w in CNC.writes])
+        self.assertNotIn(('enable', 1), CNC.writes)
+
+    def test_a_homing_session_run_by_hand_turns_the_rail_on(self):
+        # No broker: the start's reset takes the rail down, and the session
+        # enables it as the cloud client does.
+        self.m.homing_session = True
+        self.m._initialize()
+        self.assertEqual(CNC.writes.count(('enable', 1)), 1)
+
+    def test_a_homing_session_starts_only_from_an_idle_kernel(self):
+        self.handed_over()
+        for state in (MachineState.FAULT, MachineState.UNDERRUN):
+            with self.subTest(state.name):
+                CNC._state = state
+                with self.assertRaises(RuntimeError):
+                    self.m._initialize()
+                self.assertNotIn(('enable', 1), CNC.writes)
+
+    def test_a_fault_whose_lines_stay_asserted_stays_a_fault(self):
+        CNC._state = MachineState.FAULT
+        CNC.fault_held = True
+        with self.assertLogs('openglow', level='ERROR') as logs:
+            self.m._initialize()
+        self.assertIs(CNC.state, MachineState.FAULT)
+        self.assertEqual(CNC.writes.count(('enable', 1)), 1)
+        self.assertTrue(any(r.levelname == 'ERROR' for r in logs.records), logs.output)
+
+    def test_a_fault_cleared_at_the_start_is_logged_with_its_lines(self):
+        CNC._state = MachineState.FAULT
+        CNC.fault_lines = 'X-DRV Y-DRV'
+        with self.assertLogs('openglow', level='WARNING') as logs:
+            self.m._initialize()
+        self.assertIs(CNC.state, MachineState.IDLE)
+        self.assertEqual(CNC.writes.count(('enable', 1)), 1)
+        self.assertTrue(any('X-DRV Y-DRV' in r.getMessage() for r in logs.records), logs.output)
+
+    def test_the_cloud_client_on_the_brokered_device_clears_a_fault_the_same_way(self):
+        # The cloud client under forgectrl, on the device it inherited: the
+        # same one enable, and the cleared fault logged with its lines.
+        patch = mock.patch.object(machine_mod, '_inherited_pulse_dev', lambda: object())
+        patch.start()
+        self.addCleanup(patch.stop)
+        CNC._state = MachineState.FAULT
+        CNC.fault_lines = 'X-DRV'
+        with self.assertLogs('openglow', level='WARNING') as logs:
+            self.m._initialize()
+        self.assertIs(CNC.state, MachineState.IDLE)
+        self.assertEqual(CNC.writes.count(('enable', 1)), 1)
+        self.assertTrue(any('X-DRV' in r.getMessage() for r in logs.records), logs.output)
 
 
 class TempLogTests(unittest.TestCase):
@@ -1922,7 +2055,8 @@ class FeederExitTests(unittest.TestCase):
         machine_mod._conf_float = self._conf
         machine_mod.generate_linear_puls = lambda x, y, dev: None
 
-    def _make_feeder(self, source, dev):
+    def _make_feeder(self, source, dev, fire_allowed=True):
+        self.fire_allowed = fire_allowed
         self.feeder = self.JobFeeder(finished=not self.long_job)
         self.feeder.completes = self.feed_completes
         self.feeder.declare_error = self.declare_error
@@ -1961,6 +2095,69 @@ class FeederExitTests(unittest.TestCase):
         # The driver is at its drive current before any feed and any run.
         self.assertLess(w.index(('z_current', 0)), w.index(('feeder_stop', 1)))
         self.assertEqual(w.count(('z_current', 0)), 1)
+
+    def test_a_stop_from_the_handler_during_the_load_starts_no_run(self):
+        # SIGTERM's handler while the motion downloads: the kernel stopped
+        # and the latch locked at once, and the run never starts.
+        CNC.xy_steps = (0, 0)
+        CNC.run_reads = 3
+        fetch = machine_mod.fetch_motion
+
+        def loading(*a, **kw):
+            self.m.stop_now()
+            return fetch(*a, **kw)
+        machine_mod.fetch_motion = loading
+        self.m._motion_locked({'id': 42, 'action_type': 'motion', 'motion_url': 'x'}, None)
+        w = CNC.writes
+        self.assertNotIn(('run', 1), w)
+        self.assertEqual(w[w.index(('stop', 1)) + 1], ('laser_latch', 1))
+
+    def test_a_stop_from_the_handler_takes_no_lock_the_main_thread_holds(self):
+        # The homing runner's SIGTERM handler on this machine. A signal
+        # handler runs on the main thread wherever that thread is: here,
+        # inside the run loop's wake lock, which the shutdown takes too. The
+        # handler returns, the kernel stopped and the latch locked.
+        gfhome = gfhome_module()
+        self.addCleanup(setattr, gfhome, '_machine', gfhome._machine)
+        self.addCleanup(gfhome._stop.clear)
+        gfhome._machine = self.m
+        previous = signal.signal(signal.SIGTERM, gfhome._on_sigterm)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+
+        class Blocked(BaseException):
+            """Not an Exception, so the handler's own guard cannot swallow it."""
+
+        def blocked(*_):
+            raise Blocked('the handler blocked on a lock the main thread holds')
+        alarm = signal.signal(signal.SIGALRM, blocked)
+        self.addCleanup(signal.signal, signal.SIGALRM, alarm)
+        signal.setitimer(signal.ITIMER_REAL, 2.0)
+        try:
+            with self.m._run_wake._cond:
+                signal.raise_signal(signal.SIGTERM)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        self.assertEqual(CNC.writes[-2:], [('stop', 1), ('laser_latch', 1)])
+        self.assertTrue(self.m._running_action_cancelled)
+
+    def test_a_stop_the_kernel_refuses_still_locks_the_latch(self):
+        CNC.stop_error = OSError(errno.EIO, 'the kernel refused the stop')
+        self.addCleanup(setattr, CNC, 'stop_error', None)
+        self.m.stop_now()
+        self.assertEqual(CNC.writes[-1], ('laser_latch', 1))
+        self.assertTrue(self.m._running_action_cancelled)
+
+    def test_only_a_print_is_fed_as_a_job_that_may_fire(self):
+        # A motion's and a hunt's feeds refuse any FIRE byte (the feeder's
+        # own case); a print's may fire. The print ends at its arm: no verdict.
+        CNC.xy_steps = (0, 0)
+        CNC.run_reads = 3
+        COOL.stale = True
+        for action, allowed in (('motion', False), ('hunt', False), ('print', True)):
+            with self.subTest(action):
+                self.m._running_action_cancelled = False
+                self.m._motion_locked({'id': 42, 'action_type': action, 'motion_url': 'x'}, None)
+                self.assertIs(self.fire_allowed, allowed)
 
     def test_a_fault_waiting_for_its_acknowledge_refuses_the_print_before_the_button(self):
         CNC.xy_steps = (0, 0)
@@ -3372,7 +3569,8 @@ class VerdictHoldTests(unittest.TestCase):
         COOL._fire_ok = False
         CNC.run_reads = 3
         self.assertFalse(self.m._run_loop())
-        self.assertNotIn(('laser_latch', 1), CNC.writes)
+        # The lock a run that never fires starts with is its only latch write.
+        self.assertEqual(CNC.writes.count(('laser_latch', 1)), 1)
 
 
 class VerdictWaitTests(unittest.TestCase):

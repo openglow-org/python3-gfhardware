@@ -243,23 +243,29 @@ def acknowledge_hunts() -> None:
                 'after the session')
 
 
-def park_lens(half_steps: int) -> None:
+def park_lens(half_steps: int, stop=None) -> None:
     """After the runner's reference the lens sits on the hall sensor's
     rising edge. Move it `half_steps` (up positive) to the park height the
     controller asked for, at the run current in half-step mode, and rest
     the motor at the hold current. The count comes from the controller
     (GFHOME_PARK_HALF_STEPS), clamped there to the window every head
-    reaches without touching a stop; the lens never meets a stop here."""
-    from gfhardware.z_axis import ZAxis
+    reaches without touching a stop; the lens never meets a stop here.
+    `stop`, when given, is read before every step: once it answers true
+    the park ends there with LensStopped, the motor rested all the same."""
+    from gfhardware.z_axis import LensStopped, ZAxis
     from gfhardware._common import ZCur, Microstep, Dir
     if not half_steps:
         logger.info('lens park: none, the park height is the edge')
         return
     ZAxis.configure(enabled=True, current=ZCur.HIGH, mode=Microstep.HALF)
     direction = Dir.Pos if half_steps > 0 else Dir.Neg
-    for _ in range(abs(half_steps)):
-        ZAxis.step(direction)
-    ZAxis.configure(current=ZCur.LOW, mode=Microstep.HALF)
+    try:
+        for done in range(abs(half_steps)):
+            if stop is not None and stop():
+                raise LensStopped('the lens park was stopped after %d half-steps' % done)
+            ZAxis.step(direction)
+    finally:
+        ZAxis.configure(current=ZCur.LOW, mode=Microstep.HALF)
     logger.info('lens parked %+d half-steps from the hall edge', half_steps)
 
 

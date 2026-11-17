@@ -73,7 +73,12 @@ class PulseFeeder:
     and the bytes it is waiting for.
     """
 
-    def __init__(self, source, dev, chunk: int = CHUNK, retry_s: float = RETRY_S):
+    def __init__(self, source, dev, chunk: int = CHUNK, retry_s: float = RETRY_S,
+                 fire_allowed: bool = True):
+        """``fire_allowed`` False is a job that never fires (a motion, a
+        hunt): any FIRE byte in it is refused before the ring, as a FIRE
+        byte before any power byte is in a job that may fire."""
+        self._fire_allowed = fire_allowed
         self._source = source
         self._dev = dev
         self._chunk = chunk
@@ -251,13 +256,24 @@ class PulseFeeder:
         self._streaming = on
 
     def _fit_for_the_ring(self, chunk: bytes) -> bool:
-        """Refuse a stream whose first FIRE byte precedes any power byte.
+        """Refuse a stream whose first FIRE byte precedes any power byte,
+        and any FIRE byte in a job that may not fire.
 
         Checked on the way to the ring, so the offending byte never reaches
         it: a refusal before the run cancels the job; one past the primed
         window stops the feed, and the run ends on a starved ring rather
         than a full-power pulse.
         """
+        if not self._fire_allowed:
+            fire = _FIRE_BYTE.search(chunk)
+            if fire is not None:
+                self._error = PulseBodyError(
+                    'laser fire at payload byte %d in a job that never fires'
+                    % (self._scanned + fire.start()))
+                logger.error('refusing the job: %s', self._error)
+                return False
+            self._scanned += len(chunk)
+            return True
         if self._powered:
             return True
         fire = _FIRE_BYTE.search(chunk)

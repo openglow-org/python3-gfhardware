@@ -47,6 +47,7 @@ SPDX-License-Identifier: MIT
 import argparse
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -69,10 +70,77 @@ CONF_SAMPLE = '/etc/gfhome.conf.sample'
 
 logger = logging.getLogger('openglow')
 
-# SIGTERM (the controller's $H budget ran out, a supervisor stopping the
-# controller) asks the session to end; the loop sees the flag within its
-# poll and leaves through the same shutdown as every other exit.
+# SIGTERM (the controller's $H budget ran out, a soft reset, a supervisor
+# stopping the controller) ends the session from the handler itself: the
+# running action is canceled, so a motion still downloading never starts,
+# and the kernel is stopped and the latch locked at once. The handler runs
+# on the main thread between bytecodes, wherever that thread is, so it takes
+# no lock the main thread can be holding: _stop is only read there, and a
+# SIGTERM that lands inside the handler, where _stop's set holds its lock,
+# returns at once. The session then leaves through the same shutdown as
+# every other exit; a lens move under way stops at its next step.
 _stop = threading.Event()
+_machine = None             # the session's machine, once built, for the handler
+_in_handler = False         # the handler is running, on the main thread
+
+
+def _on_sigterm(*_):
+    global _in_handler
+    if _in_handler:
+        return              # the handler this one interrupted stops the machine
+    _in_handler = True
+    try:
+        _stop.set()
+        machine = _machine
+        if machine is not None:
+            try:
+                machine.stop_now()
+            except Exception:
+                logger.exception('could not stop the machine from the handler')
+    finally:
+        _in_handler = False
+
+
+def _deadline(timeout: int) -> float:
+    """When the session must end, on the monotonic clock. The controller
+    that spawns the runner hands over GFHOME_DEADLINE: its share of the $H
+    budget, counted from the session's start, which leaves the lens moves
+    and the shutdown time before the controller's own SIGTERM. Run by hand,
+    or handed a value that is not a finite number, `timeout` seconds from
+    now."""
+    try:
+        deadline = float(os.environ['GFHOME_DEADLINE'])
+    except (KeyError, ValueError):
+        deadline = math.nan
+    return deadline if math.isfinite(deadline) else time.monotonic() + timeout
+
+
+def _until(fn, deadline: float, what: str):
+    """fn() on a helper thread, waited for while SIGTERM and the deadline are
+    watched: the sign-in and the socket's connect block for seconds at a
+    time and read neither. (True, fn's result), or (False, None) once the
+    session must end, leaving the helper to the process's exit; an
+    exception in fn is raised here."""
+    box = {}
+
+    def run():
+        try:
+            box['result'] = fn()
+        except BaseException as e:
+            box['error'] = e
+    helper = threading.Thread(target=run, daemon=True)
+    helper.start()
+    while helper.is_alive():
+        if _stop.is_set():
+            logger.warning('stopped (SIGTERM) during %s - not homed', what)
+            return False, None
+        if time.monotonic() >= deadline:
+            logger.error('%s ran past the session deadline - not homed', what)
+            return False, None
+        helper.join(0.1)
+    if 'error' in box:
+        raise box['error']
+    return True, box.get('result')
 
 
 def load_config(path: str) -> bool:
@@ -166,24 +234,35 @@ class _AccelWatch(threading.Thread):
 
 
 def home(machine, args) -> int:
+    """One session, ended by args.deadline (the monotonic clock) at the
+    latest, and by SIGTERM in every phase."""
     q_rx: Queue = Queue()
     q_tx: Queue = Queue()
 
     session = get_session()
-    if not authenticate_machine(session):
+    ok, signed_in = _until(lambda: authenticate_machine(session), args.deadline, 'the sign-in')
+    if not ok:
+        return 2
+    if not signed_in:
         logger.error('sign-in to %s failed', get_cfg('SERVICE.SERVER_URL'))
         return 1
 
-    # No session passed: homing is a single short connect that never needs
-    # a reconnect token refresh.
-    ws = ws_connect(q_rx, q_tx)
+    # The session goes with the socket, so a reconnect signs in again for
+    # a fresh single-use token rather than offering the spent one.
+    ok, ws = _until(lambda: ws_connect(q_rx, q_tx, session), args.deadline, 'the socket connect')
+    if not ok:
+        return 2
     if not ws:
         logger.error('web socket connection failed')
         return 1
 
     result = 2
     try:
-        machine.start(session, q_tx)
+        try:
+            machine.start(session, q_tx)
+        except Exception:
+            logger.exception('the machine did not start - not homed')
+            return 2
 
         from gfhardware._common import InputSwitch
         switches = machine._sw_thread.all_switches()
@@ -205,9 +284,9 @@ def home(machine, args) -> int:
             if _stop.is_set():
                 logger.warning('stopped (SIGTERM) - not homed')
                 return 2
-            if now - t0 > args.timeout:
-                logger.error('homing timed out after %ds (completed: %s)',
-                             args.timeout, sorted(done) or 'nothing')
+            if now >= args.deadline:
+                logger.error('homing ran past the session deadline (completed: %s)',
+                             sorted(done) or 'nothing')
                 return 2
             if 'hunt' not in done and now - t0 > args.start_timeout:
                 logger.error('service did not start homing within %ds',
@@ -273,10 +352,11 @@ def home(machine, args) -> int:
             logger.info('service action: %s (%s)',
                         msg.get('action_type'), msg.get('status'))
             # Homing borrows the service only for camera homing; a print must
-            # never run inside a homing session (allow_print=False).
-            result = dispatch_action(machine, msg, allow_print=False)
-            if result in PULS_ACTIONS:
-                in_flight = result
+            # never run inside a homing session (allow_print=False). The
+            # answer is the action's name; the session's result stays its own.
+            answer = dispatch_action(machine, msg, allow_print=False)
+            if answer in PULS_ACTIONS:
+                in_flight = answer
     finally:
         try:
             accel.stop = True
@@ -293,49 +373,52 @@ def finish(machine, ws, result: int) -> int:
     on the hall sensor's rising edge (the controller knows its focal
     height from the focus card), then park it the half-steps the
     controller handed over; the hunt inside the session moved nothing.
-    Then the service socket is shut and the machine stopped - always:
-    nothing the lens moves raise, an exit included, may skip the stop
-    that locks the laser and releases the device. Returns the result,
-    2 when the lens moves failed.
+    Both moves read SIGTERM before every step: one stops there, the motor
+    rested, and the run is not homed. Then
+    the machine is stopped and the service socket shut, in that order -
+    always: nothing the lens moves raise, an exit included, may skip the
+    stop that locks the laser and releases the device, and the socket's
+    close, which can wait seconds for the service, never comes before it.
+    Returns the result, 2 when the lens moves failed or were skipped.
     """
     if result == 0:
         try:
-            from gfhardware.z_axis import ZAxis
-            ZAxis.home()
-            ffmachine.park_lens(int(os.environ.get('GFHOME_PARK_HALF_STEPS', '0')))
+            from gfhardware.z_axis import LensStopped, ZAxis
+            park = int(os.environ.get('GFHOME_PARK_HALF_STEPS', '0'))
+            try:
+                ZAxis.home(stop=_stop.is_set)
+                ffmachine.park_lens(park, stop=_stop.is_set)
+            except LensStopped:
+                logger.warning('stopped (SIGTERM) during the lens moves - not homed')
+                result = 2
         except BaseException:
             logger.exception('final Z reference or park failed')
             result = 2
     try:
-        ws.shutdown()
-    except BaseException:
-        logger.exception('service shutdown failed')
-    try:
         machine.stop()
     except BaseException:
         logger.exception('machine shutdown failed')
+    try:
+        ws.shutdown()
+    except BaseException:
+        logger.exception('service shutdown failed')
     return result
 
 
 def main() -> int:
-    try:
-        # The controller exports its own $H budget minus a margin, so
-        # the runner always gives up before the controller kills it.
-        timeout_default = max(30, int(os.environ.get('GFHOME_TIMEOUT_S', 240)))
-    except ValueError:
-        timeout_default = 240
-
     ap = argparse.ArgumentParser(description='ForgeFIRM one-shot Glowforge cloud homing')
     ap.add_argument('-c', '--config', default=CONF, help='config file (default %s)' % CONF)
-    ap.add_argument('--timeout', type=int, default=timeout_default,
-                    help='overall time budget in seconds (default %d)' % timeout_default)
+    ap.add_argument('--timeout', type=int, default=240,
+                    help='overall time budget in seconds when run by hand; the controller '
+                         'hands its own deadline over (default 240)')
     ap.add_argument('--start-timeout', type=int, default=120,
                     help='max seconds to wait for the service to begin homing (default 120)')
     ap.add_argument('--quiet', type=int, default=10,
                     help='silence after the last action that means done (default 10)')
     args = ap.parse_args()
+    args.deadline = _deadline(args.timeout)
 
-    signal.signal(signal.SIGTERM, lambda *_: _stop.set())
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     # Logging first: syslog under the gfhome program name, level from
     # /data/forgefirm/forgefirm.conf (log_gfhome_disk / _remote).
@@ -355,6 +438,12 @@ def main() -> int:
         logger.exception('machine init failed (is the motion controller '
                          'still holding /dev/glowforge?)')
         return 1
+    # A camera home under the GRBL controller: the session leaves the
+    # button, the lid lamp and the rail to their owners, and locks the latch
+    # as its first write.
+    machine.homing_session = True
+    global _machine
+    _machine = machine
 
     rc = home(machine, args)
     logger.info('exit %d (%s)', rc, 'homed' if rc == 0 else 'not homed')
